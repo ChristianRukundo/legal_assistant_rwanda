@@ -1,0 +1,66 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Python virtual environment
+venv/
+env/
+.venv/
+_venv/
+local/
+.python-version
+.env* # Environment variables (e.g., .env, .env.local)
+
+# Distribution / packaging
+dist/
+build/
+*.egg
+*.whl
+
+# AI/ML Specific Generated Files
+# Large models downloaded during build or runtime
+models/  # If models are downloaded or generated, ignore them
+vector_db/ # FAISS or other vector database indices
+cache/     # Disk cache for enterprise_caching_system
+
+# Logs
+*.log
+logs/
+*.txt # If text files are generated output
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# IDEs and Editors
+.vscode/           # VS Code specific settings/files
+.idea/             # IntelliJ IDEA / PyCharm
+*.sublime-project
+*.sublime-workspace
+.project
+.settings/
+.buildpath
+
+# Jupyter Notebook / IPython
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# Temporary files created by editors or OS
+*~
+.#*
+*.bak
+*.swp
+*.swo
+*.tmp
+
+# Miscellaneous
+.history/ # VSCode Local History
