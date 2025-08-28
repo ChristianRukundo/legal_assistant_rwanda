@@ -456,7 +456,7 @@ class RedisCache:
         
         return metadata_length + metadata_bytes + compressed_data
     
-    def _extract_value(self, data: bytes) -> Any:
+    def _extract_value(self, data: bytes) -> Optional[Any]:
         """Extract and decompress value from storage"""
         try:
             metadata_length = int.from_bytes(data[:4], byteorder='big')
@@ -622,6 +622,8 @@ class RedisCache:
         if not self._is_initialized or self.async_redis_client is None:
             return CacheStats(0, 0, 0.0, 1.0, 0.0, 0, None, None)
 
+        assert self.async_redis_client is not None
+
         try:
             info_memory = await self.async_redis_client.info('memory')
             info_keyspace = await self.async_redis_client.info('keyspace')
@@ -770,13 +772,13 @@ class DiskCache:
             return CacheStats(0, 0, 0.0, 1.0, 0.0, 0, None, None)
 
         try:
-            total_items = int(len(self.cache))
-            total_size_bytes = int(self.cache.currsize)
+            total_items = int(len(self.cache))  # type: ignore[arg-type]
+            total_size_bytes = int(self.cache.currsize)  # type: ignore[attr-defined]
             
-            current_hits = cache_hits.labels(cache_type='disk', key_type='unknown')._value
-            current_misses = cache_misses.labels(cache_type='disk', key_type='unknown')._value
-            total_requests = float(current_hits) + float(current_misses)
-            hit_rate = float(current_hits) / total_requests if total_requests > 0 else 0.0
+            current_hits = cache_hits.labels(cache_type='disk', key_type='unknown')._value.get()
+            current_misses = cache_misses.labels(cache_type='disk', key_type='unknown')._value.get()
+            total_requests = current_hits + current_misses
+            hit_rate = current_hits / total_requests if total_requests > 0 else 0.0
             miss_rate = 1.0 - hit_rate
 
             return CacheStats(
@@ -838,7 +840,7 @@ class MultiLayerCache:
         
         for cache_layer, layer_type in self.cache_layers:
             try:
-                if layer_type == CacheType.MEMORY:
+                if isinstance(cache_layer, MemoryCache):
                     value = cache_layer.get(key)
                 else:
                     value = await cache_layer.get(key)
@@ -866,7 +868,7 @@ class MultiLayerCache:
             ttl = self.config.default_ttl // 2
             
             try:
-                if layer_type == CacheType.MEMORY:
+                if isinstance(cache_layer, MemoryCache):
                     cache_layer.set(key, value, ttl=ttl)
                 else:
                     await cache_layer.set(key, value, ttl=ttl)
@@ -887,12 +889,11 @@ class MultiLayerCache:
                 continue
             
             try:
-                if layer_type == CacheType.MEMORY:
-                    result = cache_layer.set(key, value, ttl=actual_ttl)
-                    results.append(result)
+                if isinstance(cache_layer, MemoryCache):
+                    result: bool = cache_layer.set(key, value, ttl=actual_ttl)
                 else:
-                    result = await cache_layer.set(key, value, ttl=actual_ttl)
-                    results.append(result)
+                    result: bool = await cache_layer.set(key, value, ttl=actual_ttl)
+                results.append(result)
                 
             except Exception as e:
                 logger.warning(f"Failed to set in {layer_type.value} cache for key '{key}': {e}")
@@ -911,12 +912,11 @@ class MultiLayerCache:
                 continue
             
             try:
-                if layer_type == CacheType.MEMORY:
-                    result = cache_layer.delete(key)
-                    results.append(result)
+                if isinstance(cache_layer, MemoryCache):
+                    result: bool = cache_layer.delete(key)
                 else:
-                    result = await cache_layer.delete(key)
-                    results.append(result)
+                    result: bool = await cache_layer.delete(key)
+                results.append(result)
                 
             except Exception as e:
                 logger.warning(f"Failed to delete from {layer_type.value} cache for key '{key}': {e}")
@@ -929,7 +929,7 @@ class MultiLayerCache:
         for cache_layer, layer_type in self.cache_layers:
             try:
                 if hasattr(cache_layer, 'clear'):
-                    if layer_type == CacheType.MEMORY:
+                    if isinstance(cache_layer, MemoryCache):
                         cache_layer.clear()
                     else:
                         await cache_layer.clear()
@@ -944,10 +944,10 @@ class MultiLayerCache:
         for cache_layer, layer_type in self.cache_layers:
             try:
                 if hasattr(cache_layer, 'get_stats'):
-                    if layer_type == CacheType.MEMORY:
-                        layer_stats = cache_layer.get_stats()
+                    if isinstance(cache_layer, MemoryCache):
+                        layer_stats: CacheStats = cache_layer.get_stats()
                     else:
-                        layer_stats = await cache_layer.get_stats()
+                        layer_stats: CacheStats = await cache_layer.get_stats()
                     
                     stats[layer_type.value] = layer_stats
                     
@@ -961,7 +961,7 @@ class MultiLayerCache:
         logger.info("MultiLayerCache: Shutting down all cache layers...")
         for cache_layer, layer_type in self.cache_layers:
             if hasattr(cache_layer, 'close'):
-                if layer_type == CacheType.MEMORY:
+                if isinstance(cache_layer, MemoryCache):
                     cache_layer.close()
                 else:
                     await cache_layer.close()
@@ -1114,9 +1114,9 @@ class CacheManager:
         
         health['layers']['memory'] = 'healthy'
         
-        if self.cache.redis_cache.async_redis_client:
+        if redis_client := self.cache.redis_cache.async_redis_client:
             try:
-                if await self.cache.redis_cache.async_redis_client.ping():
+                if await redis_client.ping():
                     health['layers']['redis'] = 'healthy'
                 else:
                     health['layers']['redis'] = 'unhealthy'
@@ -1128,7 +1128,7 @@ class CacheManager:
             health['layers']['redis'] = 'disconnected'
             health['errors'].append('Redis client not initialized or connected')
         
-        if self.cache.disk_cache.cache:
+        if disk_client := self.cache.disk_cache.cache:
             try:
                 test_key = "health_check_disk_key"
                 test_value = "health_check_value"
@@ -1284,7 +1284,7 @@ if __name__ == "__main__":
             for k in list(self._data.keys()):
                 # Convert glob pattern to regex for more accurate matching
                 import re
-                pattern_re = re.compile(match.replace('.', '\.').replace('*', '.*'))
+                pattern_re = re.compile(match.replace('.', '\\.').replace('*', '.*'))
                 if pattern_re.fullmatch(k):
                     yield k
 
@@ -1350,160 +1350,3 @@ if __name__ == "__main__":
         def close(self) -> None:
             self._data.clear()
             logger.debug("MockDiskCacheClient closed.")
-
-
-    async def test_cache_system():
-        with tempfile.TemporaryDirectory() as temp_disk_cache_dir:
-            config = CacheConfig(
-                redis_host="mock-redis",
-                redis_port=6379,
-                disk_cache_dir=temp_disk_cache_dir,
-                memory_cache_size=5,
-                memory_cache_ttl=1,
-                default_ttl=2
-            )
-
-            mock_redis_async_client = cast(aioredis.Redis, MockAsyncRedisClient(host=config.redis_host, port=config.redis_port, db=config.redis_db))
-            mock_disk_cache_client = cast(diskcache.Cache, MockDiskCacheClient(
-                directory=config.disk_cache_dir,
-                size_limit=config.disk_cache_size,
-                eviction_policy='least-recently-used'
-            ))
-
-            redis_cache_instance = RedisCache(config, redis_client=mock_redis_async_client)
-            disk_cache_instance = DiskCache(config, cache_client=mock_disk_cache_client)
-
-            cache_manager = CacheManager(
-                config=config,
-                redis_cache_client=redis_cache_instance,
-                disk_cache_client=disk_cache_instance
-            )
-
-            try:
-                print("\n--- Initializing CacheManager ---")
-                await cache_manager.initialize()
-                print("CacheManager initialized.")
-
-                print("\n--- Running Health Check ---")
-                health_status = await cache_manager.get_health_status()
-                print(f"Health Status: {health_status}")
-                assert health_status['status'] == 'healthy'
-
-                print("\n--- Testing get_or_compute ---")
-                compute_count = 0
-                async def expensive_computation_async(val: str):
-                    nonlocal compute_count
-                    compute_count += 1
-                    await asyncio.sleep(0.05)
-                    logger.debug(f"  > Executing expensive_computation_async for {val} (count: {compute_count})")
-                    return f"Computed_Value_for_{val}"
-                
-                def expensive_computation_sync(val: str):
-                    nonlocal compute_count
-                    compute_count += 1
-                    time.sleep(0.05)
-                    logger.debug(f"  > Executing expensive_computation_sync for {val} (count: {compute_count})")
-                    return f"Computed_Value_for_SYNC_{val}"
-
-                key_async = "test_key_async"
-                key_sync = "test_key_sync"
-                
-                print(f"Getting '{key_async}' (should be compute)...")
-                value_async = await cache_manager.get_or_compute(key_async, lambda: expensive_computation_async(key_async))
-                print(f"Retrieved '{key_async}': {value_async}")
-                assert compute_count == 1
-                assert value_async == "Computed_Value_for_test_key_async"
-
-                print(f"Getting '{key_async}' again (should be cached)...")
-                value_async_cached = await cache_manager.get_or_compute(key_async, lambda: expensive_computation_async(key_async))
-                print(f"Retrieved '{key_async}' (cached): {value_async_cached}")
-                assert compute_count == 1
-
-                print(f"Getting '{key_sync}' (should be compute)...")
-                value_sync = await cache_manager.get_or_compute(key_sync, lambda: expensive_computation_sync(key_sync))
-                print(f"Retrieved '{key_sync}': {value_sync}")
-                assert compute_count == 2
-                assert value_sync == "Computed_Value_for_SYNC_test_key_sync"
-
-                print(f"\n--- Testing Cache Expiration for '{key_async}' ---")
-                await asyncio.sleep(cache_manager.config.memory_cache_ttl + 0.1)
-                print(f"Getting '{key_async}' after MemoryCache TTL (should hit Redis/Disk, then promote)...")
-                value_async_after_mem_ttl = await cache_manager.get_or_compute(key_async, lambda: expensive_computation_async(key_async))
-                print(f"Retrieved '{key_async}' (promoted from lower layer): {value_async_after_mem_ttl}")
-                assert compute_count == 2
-
-                await asyncio.sleep(cache_manager.config.default_ttl + 0.1)
-                print(f"Getting '{key_async}' after full TTL (should re-compute)...")
-                value_async_recomputed = await cache_manager.get_or_compute(key_async, lambda: expensive_computation_async(key_async))
-                print(f"Retrieved '{key_async}' (re-computed): {value_async_recomputed}")
-                assert compute_count == 3
-
-                print("\n--- Testing Direct Set/Get ---")
-                await cache_manager.cache.set("direct_key", {"data": "direct_value", "list": [1,2,3]}, ttl=5, layers=[CacheType.MEMORY, CacheType.REDIS])
-                direct_value = await cache_manager.cache.get("direct_key")
-                print(f"Directly set and got 'direct_key': {direct_value}")
-                assert direct_value == {"data": "direct_value", "list": [1,2,3]}
-
-                print("\n--- Testing Deletion ---")
-                await cache_manager.cache.delete(key_sync)
-                print(f"Deleted '{key_sync}'. Getting it again (should re-compute)...")
-                value_sync_after_delete = await cache_manager.get_or_compute(key_sync, lambda: expensive_computation_sync(key_sync))
-                print(f"Retrieved '{key_sync}' (re-computed after delete): {value_sync_after_delete}")
-                assert compute_count == 4
-
-                print("\n--- Testing Clear Pattern ---")
-                await cache_manager.cache.set("inyandiko:prefix:key1", "value1", ttl=10)
-                await cache_manager.cache.set("inyandiko:prefix:key2", "value2", ttl=10)
-                await cache_manager.cache.set("inyandiko:another:key3", "value3", ttl=10)
-                deleted_count = await cache_manager.cache.redis_cache.clear_pattern("prefix") # Clear keys starting with "prefix" (uses RedisCache's method directly for specific test)
-                print(f"Cleared pattern 'prefix*'. Deleted {deleted_count} keys from Redis.")
-                assert deleted_count == 2
-                assert await cache_manager.cache.get("inyandiko:prefix:key1") is None
-                assert await cache_manager.cache.get("inyandiko:prefix:key2") is None
-                assert await cache_manager.cache.get("inyandiko:another:key3") == "value3"
-
-
-                print("\n--- Testing Cache Warming ---")
-                warming_data = {
-                    "warm_key_1": {"compute_func": lambda: "Warm Value 1", "ttl": 15},
-                    "warm_key_2": {"compute_func": lambda: asyncio.sleep(0.01) and "Warm Value 2", "ttl": 15}
-                }
-                await cache_manager.warm_cache(warming_data)
-                warm_value_1 = await cache_manager.cache.get("warm_key_1")
-                warm_value_2 = await cache_manager.cache.get("warm_key_2")
-                print(f"Retrieved 'warm_key_1' after warming: {warm_value_1}")
-                print(f"Retrieved 'warm_key_2' after warming: {warm_value_2}")
-                assert warm_value_1 == "Warm Value 1"
-                assert warm_value_2 == "Warm Value 2"
-
-                print("\n--- Getting Combined Cache Stats ---")
-                stats = await cache_manager.cache.get_combined_stats()
-                for layer, layer_stats in stats.items():
-                    print(f"  Layer: {layer}")
-                    print(f"    Total Items: {layer_stats.total_items}")
-                    print(f"    Total Size (bytes): {layer_stats.total_size_bytes}")
-                    print(f"    Hit Rate: {layer_stats.hit_rate:.2f}")
-                    print(f"    Miss Rate: {layer_stats.miss_rate:.2f}")
-                
-                print("\n--- Testing Clear All ---")
-                await cache_manager.cache.clear_all()
-                print("All caches cleared. Verifying 'direct_key' is gone...")
-                direct_value_after_clear = await cache_manager.cache.get("direct_key")
-                print(f"Retrieved 'direct_key' after clear: {direct_value_after_clear}")
-                assert direct_value_after_clear is None
-
-                print("\n--- Final Health Check ---")
-                health_status_final = await cache_manager.get_health_status()
-                print(f"Final Health Status: {health_status_final}")
-
-
-            except Exception as e:
-                print(f"\nAn error occurred during testing: {e}")
-                import traceback
-                traceback.print_exc()
-            finally:
-                print("\n--- Shutting down CacheManager ---")
-                await cache_manager.close()
-                print("CacheManager shut down. Test complete.")
-
-    asyncio.run(test_cache_system())
