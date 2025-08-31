@@ -4,7 +4,7 @@ A sophisticated voice-enabled legal information system for Rwandan law in Kinyar
 
 ## 🚀 Features
 
-- **Advanced RAG Pipeline**: Multi-modal retrieval with hybrid search strategies
+- ** RAG Pipeline**: Multi-modal retrieval with hybrid search strategies
 - **Voice Processing**: Kinyarwanda ASR and TTS with emotion detection
 - **Document Intelligence**: Comprehensive PDF processing with OCR support
 - **Enterprise Caching**: Multi-layer caching with Redis and memory optimization
@@ -128,7 +128,7 @@ docker run -p 8000:8000 -v $(pwd)/legal_docs:/app/legal_docs inyandiko-backend
 
 ### Core Components
 
-1. **Advanced RAG Pipeline** (`advanced_rag_pipeline.py`)
+1. ** RAG Pipeline** (`advanced_rag_pipeline.py`)
    - Multi-modal document retrieval
    - Hybrid search combining vector similarity, BM25, and TF-IDF
    - Cross-encoder reranking for precision
@@ -143,7 +143,7 @@ docker run -p 8000:8000 -v $(pwd)/legal_docs:/app/legal_docs inyandiko-backend
 3. **Document Intelligence Processor** (`advanced_document_processor.py`)
    - Multi-format document support (PDF, DOCX, HTML, etc.)
    - OCR for scanned documents
-   - Advanced chunking strategies
+   -  chunking strategies
    - Metadata extraction and classification
 
 4. **Enterprise Caching System** (`enterprise_caching_system.py`)
@@ -323,6 +323,6 @@ For technical support and questions:
 
 ## 🔄 Version History
 
-- **v2.0.0** - Advanced RAG pipeline with enterprise features
+- **v2.0.0** - RAG pipeline with enterprise features
 - **v1.5.0** - Voice processing improvements and caching
 - **v1.0.0** - Initial release with basic RAG functionality

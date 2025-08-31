@@ -1,175 +1,148 @@
 """
-process_docs.py: Script to process legal documents and build the vector database for Inyandiko Legal AI Assistant.
+process_docs.py: CLI script to bootstrap the knowledge base for Inyandiko Legal AI Assistant.
 
-This script:
-- Loads documents from a specified directory (default: legal_docs/).
-- Processes them using AdvancedDocumentProcessor (handles PDFs, DOCX, etc., with OCR, chunking, metadata extraction).
-- Embeds chunks using Sentence Transformers.
-- Builds and saves FAISS index along with document metadata.
-- Supports async processing for efficiency.
-- Includes progress tracking, error handling, and logging.
-- CLI args for customization.
+This script iterates through all documents in the source directory and uses the
+DocumentIngestionService to process and index them into the SQLite database and
+FAISS vector store.
+
+This should be run once for initial setup, or to completely rebuild the knowledge base.
+For live updates, the DirectoryWatcherService handles ingestion automatically.
 
 Usage:
-    python process_docs.py --docs_dir legal_docs --vector_db_dir vector_db --log_level INFO
+    # Bootstrap for the first time
+    python process_docs.py
 
-Requirements:
-- Run in the project root.
-- .env file with configs (e.g., EMBEDDING_MODEL=intfloat/multilingual-e5-large).
-- legal_docs/ must contain files.
-
-Production Notes:
-- Idempotent: Skips if index exists unless --force_rebuild.
-- Handles large dirs: Batch processing to avoid OOM.
-- Graceful shutdown: Catches KeyboardInterrupt.
-- Metrics: Logs processing time, doc count, etc.
+    # Force a complete rebuild, deleting all existing data
+    python process_docs.py --force_rebuild
 """
 
 import asyncio
 import argparse
 import logging
-import os
-import json
-import time
 from pathlib import Path
-from typing import List
-from dotenv import load_dotenv
-import structlog
-from tqdm.asyncio import tqdm_asyncio  # For async progress bars
-import faiss
-import numpy as np
+from tqdm.asyncio import tqdm_asyncio
+import os
 
-from advanced_rag_pipeline import AdvancedRAGPipeline
-from advanced_document_processor import AdvancedDocumentProcessor, ProcessingStatus
-from enterprise_caching_system import CacheManager
-from intelligent_query_processor import IntelligentQueryProcessor
-from production_components import ProductionModelOrchestrator, ProductionMonitoringEngine
+from document_processor import DocumentProcessor
+from rag_pipeline import EmbeddingManager
+from data_models import initialize_database
+from document_ingestion_service import DocumentIngestionService
+from vector_store_manager import VectorStoreManager
 
-# Load environment variables
-load_dotenv()
+# Configure logging for clear output during the script execution
+logging.basicConfig(
+    level="INFO",
+    format="%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s",
+)
+logger = logging.getLogger(__name__)
 
-# Configure logging with structlog
-logger = structlog.get_logger(__name__)
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 
-async def main(args: argparse.Namespace) -> None:
-    start_time = time.monotonic()
-    logger.info("Starting document processing script...")
+async def clear_existing_knowledge_base():
+    """
+    Wipes the existing database and FAISS index for a clean rebuild.
+    This is a destructive operation and should be used with caution.
+    """
+    logger.warning("--- CLEARING EXISTING KNOWLEDGE BASE ---")
+    db_file = Path("vector_db/knowledge_base.db")
+    index_file = Path("vector_db/faiss_index.index")
 
-    # Validate paths
-    docs_dir = Path(args.docs_dir).resolve()
-    vector_db_dir = Path(args.vector_db_dir).resolve()
-    if not docs_dir.exists() or not docs_dir.is_dir():
-        logger.error(f"Documents directory does not exist: {docs_dir}")
+    try:
+        if db_file.exists():
+            db_file.unlink()
+            logger.info(f"Deleted database: {db_file}")
+        if index_file.exists():
+            index_file.unlink()
+            logger.info(f"Deleted FAISS index: {index_file}")
+    except OSError as e:
+        logger.error(f"Error while deleting knowledge base files: {e}", exc_info=True)
+
+    logger.warning("--- KNOWLEDGE BASE CLEARED ---")
+
+
+async def main(args: argparse.Namespace):
+    """Main function to bootstrap the knowledge base."""
+
+    if args.force_rebuild:
+        await clear_existing_knowledge_base()
+
+    logger.info("--- Starting Knowledge Base Bootstrap Process ---")
+
+    docs_dir = Path(args.docs_dir)
+    if not docs_dir.is_dir():
+        logger.error(
+            f"Documents directory not found: {docs_dir}. Please create it and add documents."
+        )
         return
-    vector_db_dir.mkdir(parents=True, exist_ok=True)
 
-    # Check if index already exists
-    index_path = vector_db_dir / "faiss_index.index"
-    docs_json_path = vector_db_dir / "documents.json"
-    if index_path.exists() and docs_json_path.exists() and not args.force_rebuild:
-        logger.info(f"Vector DB already exists at {vector_db_dir}. Skipping rebuild. Use --force_rebuild to override.")
-        return
+    # 1. Initialize database schema (creates the DB file and tables if they don't exist)
+    await initialize_database()
 
-    # Initialize components
-    cache_manager = CacheManager()  # Optional: For caching embeddings if heavy
-    await cache_manager.initialize()
+    # 2. Initialize core components required for ingestion
+    doc_processor = DocumentProcessor()
 
-    document_processor = AdvancedDocumentProcessor()
+    embedding_manager = EmbeddingManager()
+    await embedding_manager.initialize()  # Load the sentence-transformer model
 
-    query_analyzer = IntelligentQueryProcessor()
-    await query_analyzer.initialize()
-
-    model_orchestrator = ProductionModelOrchestrator()
-    await model_orchestrator.initialize()
-
-    monitoring_engine = ProductionMonitoringEngine()
-    await monitoring_engine.initialize()
-
-    rag_pipeline = AdvancedRAGPipeline(
-        cache_manager=cache_manager,
-        query_analyzer=query_analyzer,
-        document_processor=document_processor,
-        model_orchestrator=model_orchestrator,
-        monitoring_engine=monitoring_engine
+    vector_store_manager = VectorStoreManager(
+        index_path=Path("vector_db/faiss_index.index"),
+        embedding_manager=embedding_manager,
     )
-    await rag_pipeline.initialize()
+    await vector_store_manager.initialize()
 
-    # Gather document files
-    supported_extensions = {'.pdf', '.docx', '.txt', '.html', '.md', '.xlsx', '.csv', '.json', '.xml', '.epub', '.zip', '.rar', '.7z'}
-    doc_files: List[Path] = [f for f in docs_dir.rglob('*') if f.is_file() and f.suffix.lower() in supported_extensions]
+    ingestion_service = DocumentIngestionService(
+        doc_processor, embedding_manager, vector_store_manager
+    )
+
+    # 3. Find all supported documents in the source directory
+    supported_extensions = {".pdf", ".docx", ".txt", ".md"}
+    doc_files = [
+        p
+        for p in docs_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in supported_extensions
+    ]
+
     if not doc_files:
-        logger.warning(f"No supported documents found in {docs_dir}. Exiting.")
+        logger.warning(
+            f"No supported documents found in {docs_dir}. The knowledge base will be empty."
+        )
         return
 
     logger.info(f"Found {len(doc_files)} documents to process.")
 
-    # Process documents in batches to avoid OOM
-    batch_size = int(os.getenv("BATCH_SIZE", 32))
-    processed_docs = []
-    failed_docs = []
+    # 4. Create and run ingestion tasks concurrently for efficiency
+    tasks = [
+        ingestion_service.process_and_index_document(doc_path) for doc_path in doc_files
+    ]
 
-    async def process_batch(batch: List[Path]) -> List:
-        tasks = [rag_pipeline.document_processor.process_document(str(file)) for file in batch]
-        return await asyncio.gather(*tasks, return_exceptions=True)
+    # Use tqdm_asyncio for a real-time progress bar in the console
+    await tqdm_asyncio.gather(*tasks, desc="Processing documents", unit="file")
 
-    for i in range(0, len(doc_files), batch_size):
-        batch = doc_files[i:i + batch_size]
-        logger.info(f"Processing batch {i//batch_size + 1}/{(len(doc_files) + batch_size - 1)//batch_size} ({len(batch)} docs)...")
-        
-        results = await tqdm_asyncio.gather(process_batch(batch), desc="Processing batch")
-        
-        for result in results:
-            if isinstance(result, Exception):
-                logger.error(f"Error processing document: {result}")
-                failed_docs.append(str(result))
-            else:
-                if result.metadata.status == ProcessingStatus.COMPLETED:
-                    processed_docs.append(result)
-                else:
-                    logger.warning(f"Document processing failed: {result.metadata.file_name} - {result.metadata.error_message}")
-                    failed_docs.append(result.metadata.file_name)
+    logger.info("--- Knowledge Base Bootstrap Process Completed Successfully ---")
 
-    if not processed_docs:
-        logger.error("No documents processed successfully. Exiting.")
-        return
-
-    # Embed and build index
-    logger.info(f"Embedding {len(processed_docs)} processed documents...")
-    all_chunks = [chunk for doc in processed_docs for chunk in doc.chunks]
-    embeddings = rag_pipeline.embedding_manager.get_embeddings([chunk.content for chunk in all_chunks])
-
-    # Build FAISS index
-    dimension = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dimension)
-    index.add(embeddings)
-
-    # Save index and metadata
-    faiss.write_index(index, str(index_path))
-    with open(docs_json_path, 'w', encoding='utf-8') as f:
-        json.dump([doc.__dict__ for doc in processed_docs], f, default=str, indent=2)  # Serialize dataclass
-
-    processing_time = time.monotonic() - start_time
-    logger.info(f"Vector DB built successfully at {vector_db_dir}. Processed {len(processed_docs)} docs in {processing_time:.2f}s.")
-    if failed_docs:
-        logger.warning(f"{len(failed_docs)} documents failed: {failed_docs}")
-
-    # Cleanup
-    await cache_manager.close()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Process legal documents and build vector DB.")
-    parser.add_argument("--docs_dir", default="legal_docs", help="Directory containing legal documents.")
-    parser.add_argument("--vector_db_dir", default="vector_db", help="Directory to save vector DB.")
-    parser.add_argument("--force_rebuild", action="store_true", help="Force rebuild even if index exists.")
-    parser.add_argument("--log_level", default="INFO", help="Logging level (DEBUG, INFO, etc.).")
+    parser = argparse.ArgumentParser(
+        description="Bootstrap the Inyandiko knowledge base by processing and indexing all documents."
+    )
+    parser.add_argument(
+        "--docs_dir",
+        default="legal_docs",
+        help="Directory containing the source legal documents.",
+    )
+    parser.add_argument(
+        "--force_rebuild",
+        action="store_true",
+        help="Force a complete rebuild by deleting the existing database and vector index before starting.",
+    )
 
     args = parser.parse_args()
-    logging.getLogger().setLevel(args.log_level.upper())
 
     try:
         asyncio.run(main(args))
     except KeyboardInterrupt:
-        logger.info("Script interrupted by user. Cleaning up...")
+        logger.info("Bootstrap process interrupted by user.")
     except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)   
+        logger.error(
+            f"An unexpected error occurred during the bootstrap process: {e}",
+            exc_info=True,
+        )
