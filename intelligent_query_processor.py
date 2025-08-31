@@ -8,11 +8,12 @@ import json
 import logging
 import asyncio
 from typing import Dict, List, Optional, Tuple, Any, Union, Set
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from enum import Enum
 from datetime import datetime, timedelta
 import numpy as np
-from collections import defaultdict, Counter
+from collections import defaultdict
+from collections import Counter as CollectionsCounter
 import pickle
 import hashlib
 
@@ -26,8 +27,13 @@ from nltk.chunk import ne_chunk
 from nltk.tree import Tree
 import spacy
 from textblob import TextBlob
-import langdetect
-from langdetect import detect, DetectorFactory
+try:
+    import langdetect
+    from langdetect import detect, DetectorFactory
+except ImportError:
+    langdetect = None
+    detect = None
+    DetectorFactory = None
 
 
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
@@ -39,6 +45,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
+import itertools
+
 import joblib
 
 
@@ -66,9 +74,11 @@ import multiprocessing as mp
 
 from prometheus_client import Counter, Histogram, Gauge
 import time
+import structlog
 
-
-DetectorFactory.seed = 0
+logger = structlog.get_logger(__name__)
+if DetectorFactory:
+    DetectorFactory.seed = 0
 
 
 required_nltk_data = ['punkt', 'stopwords', 'wordnet', 'averaged_perceptron_tagger', 'maxent_ne_chunker', 'words']
@@ -213,6 +223,7 @@ class ProcessedQuery:
     requires_disclaimer: bool
     suggested_followup: List[str]
     processing_time: float
+    expanded_queries: List[str] = field(default_factory=list)
     context: Optional[QueryContext] = None
     embedding: Optional[np.ndarray] = None
     
@@ -599,7 +610,7 @@ class EmotionAnalyzer:
                 "mfite ubwoba", "ndagira impungenge"  
             ],
             EmotionalTone.ANGRY: [
-                "angry", "mad", "furious", "outraged", "livid",
+                "angry", "mad", "furious", "furious", "outraged", "livid",
                 "narakaye", "mbaruye"  
             ],
             EmotionalTone.GRATEFUL: [
@@ -624,9 +635,7 @@ class EmotionAnalyzer:
             blob = TextBlob(text)
             
             
-            
-            
-            sentiment_polarity = blob.sentiment.polarity
+            sentiment_polarity = blob.sentiment.polarity  # type: ignore
             
             
             if sentiment_polarity < -0.5:
@@ -717,7 +726,7 @@ class QueryComplexityAnalyzer:
 class IntelligentQueryProcessor:
     """Main intelligent query processing system"""
     
-    def __init__(self, config: Dict[str, Any] = Dist):
+    def __init__(self, config: Dict[str, Any] = {}):
         self.config = config or {}
         
         
@@ -744,33 +753,70 @@ class IntelligentQueryProcessor:
         
         self.conversation_contexts = {}
         self.context_timeout = timedelta(hours=2)
+        
+        
+    async def initialize(self) -> None:
+        """Initialize the query processor and load necessary resources"""
+        logger.info("Initializing IntelligentQueryProcessor...")
+        try:
+            # Load SentenceTransformer model
+            if self.sentence_model is None:
+                self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+                logger.info("Loaded SentenceTransformer model.")
+
+            # Ensure NLTK data is available
+            for data in required_nltk_data:
+                try:
+                    nltk.data.find(f'tokenizers/{data}')
+                except LookupError:
+                    try:
+                        nltk.data.find(f'corpora/{data}')
+                    except LookupError:
+                        try:
+                            nltk.data.find(f'taggers/{data}')
+                        except LookupError:
+                            try:
+                                nltk.data.find(f'chunkers/{data}')
+                            except LookupError:
+                                nltk.download(data, quiet=True)
+
+            # Verify spaCy models
+            if nlp_en is None:
+                logger.warning("English spaCy model not loaded.")
+            if nlp_rw is None:
+                logger.warning("Kinyarwanda spaCy model not loaded.")
+
+            self.is_initialized = True
+            logger.info("IntelligentQueryProcessor initialized successfully.")
+        except Exception as e:
+            logger.error(f"Failed to initialize IntelligentQueryProcessor: {str(e)}")
+            self.is_initialized = False
+            raise
     
     def _detect_language(self, text: str) -> QueryLanguage:
         """Detect the language of the query"""
         try:
             if len(text.strip()) < 3:
                 return QueryLanguage.UNKNOWN
-            
-            detected_lang = langdetect.detect(text)
-            
-            
-            lang_mapping = {
-                'rw': QueryLanguage.KINYARWANDA,
-                'en': QueryLanguage.ENGLISH,
-                'fr': QueryLanguage.FRENCH,
-                'sw': QueryLanguage.SWAHILI
-            }
-            
-            return lang_mapping.get(detected_lang, QueryLanguage.UNKNOWN)
-            
+
+            if detect is not None:
+                detected_lang = detect(text)
+                lang_mapping = {
+                    'rw': QueryLanguage.KINYARWANDA,
+                    'en': QueryLanguage.ENGLISH,
+                    'fr': QueryLanguage.FRENCH,
+                    'sw': QueryLanguage.SWAHILI
+                }
+                return lang_mapping.get(detected_lang, QueryLanguage.UNKNOWN)
+            else:
+                raise Exception("langdetect not available")
         except Exception:
-            
             kinyarwanda_indicators = ['amategeko', 'urukiko', 'ubucamanza', 'umwunganira', 'murakoze']
             text_lower = text.lower()
-            
+
             if any(indicator in text_lower for indicator in kinyarwanda_indicators):
                 return QueryLanguage.KINYARWANDA
-            
+
             return QueryLanguage.ENGLISH  
     
     def _clean_query(self, text: str) -> str:
@@ -864,7 +910,7 @@ class IntelligentQueryProcessor:
             pos_tags = [(token, 'NN') for token in filtered_tokens]
         
         
-        word_freq = Counter(filtered_tokens)
+        word_freq = CollectionsCounter(filtered_tokens)
         
         
         for token, tag in pos_tags: 
@@ -896,6 +942,47 @@ class IntelligentQueryProcessor:
         
         keywords.sort(key=lambda x: x.importance_score * x.legal_relevance, reverse=True)
         return keywords[:20]  
+    
+    
+    def _expand_query(self, keywords: List[QueryKeyword], entities: List[LegalEntity]) -> List[str]:
+        """Generates expanded queries from keywords and entities."""
+        if not keywords:
+            return []
+
+        # Get top 3 keywords and top 2 entities
+        top_keywords = [kw.word for kw in keywords[:3]]
+        top_entities = [ent.text for ent in entities[:2]]
+        
+        # Combine them into a single list of important terms, avoiding duplicates
+        core_terms = list(dict.fromkeys(top_keywords + top_entities))
+        if not core_terms:
+            return []
+
+        expanded_queries = set()
+        
+        # Simple combinations
+        if len(core_terms) > 1:
+            expanded_queries.add(" ".join(core_terms))
+            expanded_queries.add(" ".join(reversed(core_terms)))
+        
+        # Question-style queries
+        expanded_queries.add(f"what is the law regarding {' and '.join(core_terms)}")
+        expanded_queries.add(f"details about {' and '.join(core_terms)}")
+        
+        # Permutations of top keywords
+        if len(top_keywords) > 1:
+            for p in itertools.permutations(top_keywords):
+                expanded_queries.add(" ".join(p))
+                if len(expanded_queries) >= 5: # Limit permutations
+                    break
+
+        # Remove the original keyword order if it exists to avoid redundancy
+        original_combo = " ".join(top_keywords)
+        if original_combo in expanded_queries and len(expanded_queries) > 1:
+            expanded_queries.remove(original_combo)
+
+        return list(expanded_queries)[:4] # Return up to 4 expanded queries
+
     
     def _determine_question_type(self, text: str, language: QueryLanguage) -> str:
         """Determine the type of question being asked"""
@@ -1030,9 +1117,33 @@ class IntelligentQueryProcessor:
             
             
             embedding = self.sentence_model.encode(text, convert_to_numpy=True)
+            if isinstance(embedding, torch.Tensor):
+                embedding = embedding.detach().cpu().numpy()
+            elif isinstance(embedding, list):
+                embedding = np.array(embedding)
             return embedding 
         except Exception:
             return None
+        
+    async def comprehensive_analyze(
+        self,
+        query: str,
+        language: str,
+        session_id: str
+    ) -> ProcessedQuery:
+        """Comprehensive query analysis with context"""
+        return await self.process_query(
+            query=query,
+            context=QueryContext(
+                previous_queries=[],
+                session_id=session_id,
+                user_id=None,
+                conversation_history=[],
+                domain_context=None,
+                geographic_context="Rwanda"
+            )
+        )
+
     
     async def process_query(
         self,
@@ -1113,6 +1224,9 @@ class IntelligentQueryProcessor:
             
             embedding = self._create_embedding(cleaned_query)
             
+            expanded_queries = self._expand_query(keywords, entities)
+
+            
             
             processing_time = time.time() - start_time
             
@@ -1133,6 +1247,7 @@ class IntelligentQueryProcessor:
                 requires_disclaimer=requires_disclaimer,
                 suggested_followup=suggested_followup,
                 processing_time=processing_time,
+                expanded_queries=expanded_queries, 
                 context=context,
                 embedding=embedding,
                 metadata={
@@ -1300,4 +1415,38 @@ class IntelligentQueryProcessor:
         """Cleanup resources"""
         self.thread_pool.shutdown(wait=True)
         self.clear_cache()
-        self.conversation_contexts.clear()
+        self.conversation_contexts.clear() 
+    
+    async def health_check(self) -> bool:
+        """Check health of query processor components"""
+        try:
+            if self.sentence_model is None:
+                logger.warning("SentenceTransformer model not loaded.")
+                return False
+            
+            if nlp_en is None:
+                logger.warning("English spaCy model not loaded.")
+                return False
+            
+            if nlp_rw is None:
+                logger.warning("Kinyarwanda spaCy model not loaded.")
+            
+            
+            if not self.intent_classifier.is_trained:
+                logger.warning("Intent classifier not trained.")
+            
+            
+            try:
+                test_query = "This is a test query."
+                processed = await self.process_query(test_query, use_cache=False)
+                if processed.intent == QueryIntent.UNKNOWN:
+                    logger.warning("Test query processing failed.")
+                    return False
+            except Exception:
+                return False
+            
+            logger.info("Query processor health check passed.")
+            return True
+            
+        except Exception:
+            return False

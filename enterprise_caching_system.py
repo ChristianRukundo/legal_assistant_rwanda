@@ -35,7 +35,8 @@ import orjson
 from prometheus_client import Counter, Histogram, Gauge
 
 # Configuration
-from pydantic_settings import BaseSettings, SettingsConfigDict, Field # Correct import for BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict # Correct import for BaseSettings
+from pydantic import Field
 
 # Logging setup
 logging.basicConfig(
@@ -171,7 +172,10 @@ class SerializationManager:
             elif serialization_type == SerializationType.PICKLE:
                 return pickle.dumps(obj)
             elif serialization_type == SerializationType.MSGPACK:
-                return msgpack.packb(obj, default=str, use_bin_type=True)
+                packed = msgpack.packb(obj, default=str, use_bin_type=True)
+                if packed is None:
+                    raise ValueError("msgpack.packb returned None")
+                return packed
             elif serialization_type == SerializationType.ORJSON:
                 return orjson.dumps(obj, default=str)
             else:
@@ -387,45 +391,44 @@ class RedisCache:
     
     async def initialize(self) -> None:
         """Initialize Redis connections"""
-        if self.async_redis_client is None:
+        if self._is_initialized:
+            return
+
+        if self.async_redis_client:
             try:
-                self.redis_client_sync = redis.Redis(
-                    host=self.config.redis_host,
-                    port=self.config.redis_port,
-                    password=self.config.redis_password,
-                    db=self.config.redis_db,
-                    max_connections=self.config.redis_max_connections,
-                    decode_responses=False,
-                    socket_timeout=5,
-                    socket_connect_timeout=5
-                )
-                
-                # type: ignore [call-arg] is added for specific redis-py versions where `decode_responses`
-                # might be strictly typed as bool in stubs but allows other types in practice or with different versions.
-                self.async_redis_client = aioredis.Redis( # type: ignore
-                    host=self.config.redis_host,
-                    port=self.config.redis_port,
-                    password=self.config.redis_password,
-                    db=self.config.redis_db,
-                    max_connections=self.config.redis_max_connections,
-                    decode_responses=False, # type: ignore
-                    socket_timeout=5,
-                    socket_connect_timeout=5
-                )
-                
                 await self.async_redis_client.ping()
                 self._is_initialized = True
-                logger.info(f"Redis cache initialized successfully. Connected to {self.config.redis_host}:{self.config.redis_port}/{self.config.redis_db}.")
-                
-            except Exception as e:
-                self._is_initialized = False
+                logger.info("Redis cache initialized with provided client.")
+                return
+            except (ConnectionError, TimeoutError, OSError) as e:
+                logger.warning(f"Provided Redis client failed to connect: {e}")
                 self.async_redis_client = None
-                self.redis_client_sync = None
-                logger.error(f"Failed to initialize Redis cache connection: {e}", exc_info=True)
-        else:
-            self._is_initialized = True
-            logger.info("Redis cache initialized with provided client (likely mock).")
 
+        try:
+            pool = aioredis.ConnectionPool.from_url(
+                f"redis://{self.config.redis_host}:{self.config.redis_port}/{self.config.redis_db}",
+                password=self.config.redis_password,
+                max_connections=self.config.redis_max_connections,
+                socket_timeout=5,
+                socket_connect_timeout=5,
+                decode_responses=False
+            )
+            self.async_redis_client = aioredis.Redis(connection_pool=pool)
+            await self.async_redis_client.ping()
+            self._is_initialized = True
+            logger.info(f"Redis cache initialized successfully. Connected to {self.config.redis_host}:{self.config.redis_port}/{self.config.redis_db}.")
+            
+        except (ConnectionError, TimeoutError, OSError) as e:
+            self._is_initialized = False
+            self.async_redis_client = None
+            logger.warning(f"Could not connect to Redis at {self.config.redis_host}:{self.config.redis_port}. "
+                           f"Reason: {e}. The application will proceed without Redis caching. "
+                           "Please ensure Redis is running and accessible to enable distributed caching.")
+        except Exception as e:
+            self._is_initialized = False
+            self.async_redis_client = None
+            logger.error(f"An unexpected error occurred while initializing Redis cache: {e}", exc_info=True)
+    
     async def _create_cache_key(self, key: str, prefix: str = "inyandiko") -> str:
         """Create prefixed cache key"""
         if len(key) > self.config.max_key_length:
@@ -686,7 +689,7 @@ class DiskCache:
                 self.cache = None
                 logger.error(f"Failed to initialize disk cache at '{self.cache_dir}': {e}", exc_info=True)
         else:
-            logger.info("Disk cache initialized with provided client (likely mock).")
+            logger.info("Disk cache initialized with provided client.")
     
     async def get(self, key: str) -> Optional[Any]:
         """Get value from disk cache"""
@@ -1114,7 +1117,7 @@ class CacheManager:
         
         health['layers']['memory'] = 'healthy'
         
-        if redis_client := self.cache.redis_cache.async_redis_client:
+        if self.cache.redis_cache._is_initialized and (redis_client := self.cache.redis_cache.async_redis_client):
             try:
                 if await redis_client.ping():
                     health['layers']['redis'] = 'healthy'
@@ -1126,7 +1129,6 @@ class CacheManager:
                 health['errors'].append(f'Redis connection error: {str(e)}')
         else:
             health['layers']['redis'] = 'disconnected'
-            health['errors'].append('Redis client not initialized or connected')
         
         if disk_client := self.cache.disk_cache.cache:
             try:
@@ -1148,7 +1150,7 @@ class CacheManager:
             health['errors'].append('Disk cache not initialized')
         
         if health['errors']:
-            health['status'] = 'degraded' if len(health['errors']) < 2 else 'unhealthy'
+            health['status'] = 'degraded'
         
         return health
 
@@ -1159,11 +1161,10 @@ class CacheManager:
         
         if self._background_tasks_started:
             logger.info("CacheManager: Waiting for background tasks to complete...")
-            # Set a timeout for waiting for background tasks to prevent indefinite hang
             try:
-                await asyncio.wait_for(self._shutdown_complete.wait(), timeout=10) # Wait up to 10 seconds
+                await asyncio.wait_for(self._shutdown_complete.wait(), timeout=5)
             except asyncio.TimeoutError:
-                logger.warning("CacheManager: Timeout waiting for background tasks to complete. Some tasks might still be running.")
+                logger.warning("CacheManager: Timeout waiting for background tasks to complete.")
             logger.info("CacheManager: All background tasks stopped.")
 
         if self.cache_warming_tasks:
@@ -1175,6 +1176,28 @@ class CacheManager:
 
         await self.cache.close()
         logger.info("CacheManager: Shut down complete.")
+
+    async def get_transcription_cache(self, audio_hash: str) -> Optional[Dict[str, Any]]:
+        """Get transcription from cache."""
+        return cast(Optional[Dict[str, Any]], await self.cache.get(f"transcription:{audio_hash}"))
+    
+    async def cache_transcription(self, audio_hash: str, result: Dict[str, Any]):
+        """Cache transcription result."""
+        await self.cache.set(f"transcription:{audio_hash}", result)
+    
+    async def get_tts_cache(self, tts_hash: str) -> Optional[bytes]:
+        """Get TTS audio from cache."""
+        cached = await self.cache.get(f"tts:{tts_hash}")
+        return cast(Optional[bytes], cached) if cached else None
+    
+    async def cache_tts(self, tts_hash: str, audio_bytes: bytes):
+        """Cache TTS audio bytes."""
+        await self.cache.set(f"tts:{tts_hash}", audio_bytes)
+    
+    async def health_check(self) -> bool:
+        """Check health of all cache layers."""
+        health = await self.get_health_status()
+        return health['status'] == 'healthy'
 
 
 # --- Global Cache Manager Instance (for production integration) ---
@@ -1215,138 +1238,3 @@ async def cache_get_or_compute(key: str, compute_func: Callable[..., Any], ttl: 
     """Get value from the global cache manager or compute if not found."""
     manager = await get_cache_manager()
     return await manager.get_or_compute(key, compute_func, ttl=ttl, force_refresh=force_refresh)
-
-
-# --- Example Usage for Self-Contained Testing ---
-if __name__ == "__main__":
-    # Configure logging to DEBUG for detailed output during testing
-    logging.getLogger(__name__).setLevel(logging.DEBUG)
-    logging.getLogger('MemoryCache').setLevel(logging.DEBUG)
-    logging.getLogger('RedisCache').setLevel(logging.DEBUG)
-    logging.getLogger('DiskCache').setLevel(logging.DEBUG)
-    logging.getLogger('MultiLayerCache').setLevel(logging.DEBUG)
-    logging.getLogger('CacheManager').setLevel(logging.DEBUG)
-
-
-    print("\n--- Starting Enterprise Cache System Self-Contained Test ---")
-
-    # Mock Redis client for testing RedisCache in isolation (in-memory simulation)
-    # This class explicitly provides the asynchronous methods expected by RedisCache
-    # and is cast to aioredis.Redis for type checking in the production code.
-    class MockAsyncRedisClient:
-        def __init__(self, host: str = "localhost", port: int = 6379, db: int = 0, password: Optional[str] = None, **kwargs):
-            self._data: Dict[str, Tuple[bytes, Optional[float]]] = {} # {key: (value, expire_at_timestamp)}
-            self._db = db
-            self._host = host
-            self._port = port
-            logger.debug(f"MockAsyncRedisClient initialized for db {db} at {host}:{port}.")
-
-        async def ping(self) -> bool:
-            await asyncio.sleep(0.001) # Simulate minimal network delay
-            return True
-
-        async def get(self, key: str) -> Optional[bytes]:
-            await asyncio.sleep(0.001)
-            entry = self._data.get(key)
-            if entry:
-                value, expire_at = entry
-                if expire_at is None or time.time() < expire_at:
-                    return value
-                else:
-                    del self._data[key] # Expired
-            return None
-
-        async def set(self, key: str, value: bytes) -> bool:
-            await asyncio.sleep(0.001)
-            self._data[key] = (value, None)
-            return True
-
-        async def setex(self, key: str, time_seconds: int, value: bytes) -> bool:
-            await asyncio.sleep(0.001)
-            expire_at = time.time() + time_seconds
-            self._data[key] = (value, expire_at)
-            return True
-
-        async def delete(self, *keys: str) -> int:
-            await asyncio.sleep(0.001)
-            deleted_count = 0
-            for key in keys:
-                if key in self._data:
-                    del self._data[key]
-                    deleted_count += 1
-            return deleted_count
-
-        async def scan_iter(self, match: str = '*') -> AsyncGenerator[str, None]:
-            """Mock scan_iter for pattern matching."""
-            await asyncio.sleep(0.001)
-            # Simple glob-like matching for testing, not full regex
-            # The match pattern here *includes* the prefix from RedisCache._create_cache_key
-            for k in list(self._data.keys()):
-                # Convert glob pattern to regex for more accurate matching
-                import re
-                pattern_re = re.compile(match.replace('.', '\\.').replace('*', '.*'))
-                if pattern_re.fullmatch(k):
-                    yield k
-
-        async def flushdb(self) -> bool:
-            await asyncio.sleep(0.001)
-            self._data.clear()
-            return True
-
-        async def info(self, section: str = 'all') -> Dict[str, Any]:
-            await asyncio.sleep(0.001)
-            if section == 'memory':
-                total_bytes = sum(len(v) for v, _ in self._data.values())
-                return {'used_memory': total_bytes}
-            elif section == 'keyspace':
-                return {f'db{self._db}': {'keys': len(self._data)}}
-            return {}
-
-        async def close(self) -> None:
-            await asyncio.sleep(0.001)
-            self._data.clear()
-            logger.debug("MockAsyncRedisClient closed.")
-
-    # Mock DiskCache client for testing DiskCache in isolation (in-memory simulation)
-    class MockDiskCacheClient:
-        def __init__(self, directory: str, size_limit: int, eviction_policy: str):
-            self._data: Dict[str, Tuple[Any, Optional[float]]] = {} # {key: (value, expire_at_timestamp)}
-            self._directory = directory
-            self._size_limit = size_limit # Not strictly enforced by mock
-            self._eviction_policy = eviction_policy # Not strictly enforced by mock
-            logger.debug(f"MockDiskCacheClient initialized for directory '{directory}'.")
-        
-        def __len__(self) -> int:
-            return len(self._data)
-
-        @property
-        def currsize(self) -> int:
-            # Simple estimation for mock
-            return sum(len(pickle.dumps(v)) for v, _ in self._data.values())
-
-        def get(self, key: str) -> Optional[Any]:
-            entry = self._data.get(key)
-            if entry:
-                value, expire_at = entry
-                if expire_at is None or time.time() < expire_at:
-                    return value
-                else:
-                    del self._data[key] # Expired
-            return None
-
-        def set(self, key: str, value: Any, expire: Optional[float] = None) -> bool:
-            self._data[key] = (value, expire)
-            return True
-
-        def delete(self, key: str) -> bool:
-            if key in self._data:
-                del self._data[key]
-                return True
-            return False
-
-        def clear(self) -> None:
-            self._data.clear()
-
-        def close(self) -> None:
-            self._data.clear()
-            logger.debug("MockDiskCacheClient closed.")

@@ -26,6 +26,9 @@ import noisereduce as nr
 import scipy.signal
 import structlog
 
+from enterprise_caching_system import CacheManager
+from production_components import ProductionModelOrchestrator, ProductionMonitoringEngine
+
 # Initialize logging
 logger = structlog.get_logger(__name__)
 
@@ -88,8 +91,8 @@ class AdvancedASREngine:
         try:
             for model_name, model_path in self.model_configs.items():
                 logger.info(f"Loading Whisper model: {model_path} for {model_name} on {self.device}")
-                processor = AutoProcessor.from_pretrained(model_path, use_auth_token=True)
-                model = AutoModelForSpeechSeq2Seq.from_pretrained(model_path, use_auth_token=True).to(self.device)
+                processor = AutoProcessor.from_pretrained(model_path)
+                model = AutoModelForSpeechSeq2Seq.from_pretrained(model_path).to(self.device)
                 self.asr_processors[model_name] = processor
                 self.asr_models[model_name] = model
                 logger.info(f"{model_name} model loaded.")
@@ -172,24 +175,38 @@ class AdvancedASREngine:
         return audio_array
     
     def _enhance_audio(self, audio: np.ndarray) -> np.ndarray:
-        """Apply audio enhancement techniques"""
-        # Apply high-pass filter to remove low-frequency noise
+        """Apply audio enhancement techniques."""
+        processed_audio = np.asarray(audio, dtype=np.float32).flatten()
+    
         sos = scipy.signal.butter(5, 80, btype='high', fs=self.config.sample_rate, output='sos')
-        audio = scipy.signal.sosfilt(sos, audio)
-        
-        # Apply dynamic range compression
+        filtered_audio_output = scipy.signal.sosfilt(sos, processed_audio)
+   
+        filtered_audio: np.ndarray
+        if isinstance(filtered_audio_output, tuple):
+            filtered_audio = filtered_audio_output[0]
+        else:
+            filtered_audio = filtered_audio_output
+    
+        if filtered_audio.size == 0 or np.all(filtered_audio == 0):
+            logger.warning("Audio array became silent or empty after filtering. Skipping further enhancement.")
+            return filtered_audio
+    
         audio_segment = AudioSegment(
-            audio.tobytes(), 
+            data=filtered_audio.tobytes(),
             frame_rate=self.config.sample_rate,
-            sample_width=audio.dtype.itemsize,
+            sample_width=filtered_audio.dtype.itemsize,
             channels=1
         )
-        compressed = compress_dynamic_range(audio_segment, threshold=-20.0, ratio=4.0)
-        
-        enhanced_audio = np.array(compressed.get_array_of_samples(), dtype=np.float32)
-        enhanced_audio = enhanced_audio / np.max(np.abs(enhanced_audio))
+        compressed_segment = compress_dynamic_range(audio_segment, threshold=-20.0, ratio=4.0)
+    
+        enhanced_audio = np.array(compressed_segment.get_array_of_samples(), dtype=np.float32)
+    
+        max_val = np.max(np.abs(enhanced_audio))
+        if max_val > 0:
+            enhanced_audio = enhanced_audio / max_val
         
         return enhanced_audio
+
     
     def _apply_vad(self, audio: np.ndarray) -> np.ndarray:
         """Apply Voice Activity Detection to remove silence"""
@@ -469,7 +486,9 @@ class AdvancedTTSEngine:
             for lang, model_path in self.model_configs.items():
                 logger.info(f"Loading MMS-TTS model: {model_path} for {lang} on {self.device}")
                 processor = AutoProcessor.from_pretrained(model_path)
-                model = VitsModel.from_pretrained(model_path).to(self.device)
+                model = VitsModel.from_pretrained(model_path)
+                if hasattr(model, "to"):
+                    model = model.to(self.device) # type: ignore
                 self.tts_processors[lang] = processor
                 self.tts_models[lang] = model
                 logger.info(f"{lang} TTS model loaded.")
@@ -638,69 +657,11 @@ class AdvancedTTSEngine:
         audio_segment.export(buffer, format=format)
         return buffer.getvalue()
 
-# --- Mocking external dependencies for self-contained testing ---
-class MockCacheManager:
-    """A mock cache manager for testing purposes."""
-    def __init__(self):
-        self.transcription_cache: Dict[str, Any] = {}
-        self.tts_cache: Dict[str, bytes] = {}
-        logger.info("MockCacheManager initialized.")
-
-    async def get_transcription_cache(self, audio_hash: str) -> Optional[Dict[str, Any]]:
-        logger.info(f"MockCacheManager: Getting transcription for {audio_hash}")
-        return self.transcription_cache.get(audio_hash)
-
-    async def cache_transcription(self, audio_hash: str, result: Dict[str, Any]):
-        logger.info(f"MockCacheManager: Caching transcription for {audio_hash}")
-        self.transcription_cache[audio_hash] = result
-
-    async def get_tts_cache(self, tts_hash: str) -> Optional[bytes]:
-        logger.info(f"MockCacheManager: Getting TTS audio for {tts_hash}")
-        return self.tts_cache.get(tts_hash)
-
-    async def cache_tts(self, tts_hash: str, audio_bytes: bytes):
-        logger.info(f"MockCacheManager: Caching TTS audio for {tts_hash}")
-        self.tts_cache[tts_hash] = audio_bytes
-
-    async def close(self):
-        logger.info("MockCacheManager closed.")
-        self.transcription_cache.clear()
-        self.tts_cache.clear()
-
-    async def health_check(self) -> bool:
-        return True
-
-class MockSessionManager:
-    """A mock session manager for testing purposes."""
-    def __init__(self):
-        logger.info("MockSessionManager initialized.")
-    async def health_check(self) -> bool:
-        return True
-
-class MockModelOrchestrator:
-    """A mock model orchestrator for testing purposes."""
-    def __init__(self):
-        logger.info("MockModelOrchestrator initialized.")
-    async def health_check(self) -> bool:
-        return True
-
-class MockMonitoringEngine:
-    """A mock monitoring engine for testing purposes."""
-    def __init__(self):
-        logger.info("MockMonitoringEngine initialized.")
-    async def log_voice_metrics(self, metrics: Dict[str, Any]):
-        logger.info(f"MockMonitoringEngine: Logged voice metrics: {metrics}")
-    async def health_check(self) -> bool:
-        return True
-
-# --- Main Voice Processor Class (unchanged constructor, but now works with mocks) ---
 class SophisticatedVoiceProcessor:
     """Main voice processor orchestrating ASR and TTS"""
     
-    def __init__(self, cache_manager: MockCacheManager, session_manager: MockSessionManager, 
-                 model_orchestrator: MockModelOrchestrator, monitoring_engine: MockMonitoringEngine):
+    def __init__(self, cache_manager: CacheManager, model_orchestrator: ProductionModelOrchestrator, monitoring_engine: ProductionMonitoringEngine):
         self.cache_manager = cache_manager
-        self.session_manager = session_manager
         self.model_orchestrator = model_orchestrator
         self.monitoring_engine = monitoring_engine
         
@@ -766,7 +727,7 @@ class SophisticatedVoiceProcessor:
             await self.cache_manager.cache_transcription(audio_hash, result)
             
             # Log metrics
-            await self.monitoring_engine.log_voice_metrics({
+            await self.monitoring_engine.log_query_metrics({
                 "session_id": session_id,
                 "transcription_confidence": voice_analysis.confidence_score,
                 "detected_language": voice_analysis.detected_language,
@@ -828,9 +789,8 @@ class SophisticatedVoiceProcessor:
                 logger.error("TTS models not loaded.")
                 return False
             
-            # Check mock dependencies health
+            # Check dependencies health
             if not await self.cache_manager.health_check(): return False
-            if not await self.session_manager.health_check(): return False
             if not await self.model_orchestrator.health_check(): return False
             if not await self.monitoring_engine.health_check(): return False
 
