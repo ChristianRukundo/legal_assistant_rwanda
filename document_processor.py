@@ -374,15 +374,7 @@ class TextAnalyzer:
     def __init__(self, config: DocumentProcessorConfig):
         self.config = config
         self.stop_words = set(stopwords.words("english"))
-        try:
-            self.sentence_model = sentence_transformers.SentenceTransformer(
-                "all-MiniLM-L6-v2"
-            )
-        except Exception as e:
-            logging.warning(
-                f"Could not load SentenceTransformer model: {e}. Semantic features will be disabled."
-            )
-            self.sentence_model = None
+        self.sentence_model: Optional[sentence_transformers.SentenceTransformer] = None
         self.kw_extractor = yake.KeywordExtractor(
             lan="en", n=3, dedupLim=0.9, top=self.config.max_keywords, features=None
         )
@@ -391,6 +383,27 @@ class TextAnalyzer:
             "EMAIL": re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"),
             "PHONE": re.compile(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}"),
         }
+
+    async def initialize(self):
+        """Initializes heavy components like ML models asynchronously."""
+        if self.sentence_model is not None:
+            return
+
+        logger.info("Initializing TextAnalyzer: loading SentenceTransformer model...")
+        try:
+            loop = asyncio.get_running_loop()
+            # Use a default executor for the blocking model load
+            self.sentence_model = await loop.run_in_executor(
+                None,
+                sentence_transformers.SentenceTransformer,
+                "all-MiniLM-L6-v2",
+            )
+            logger.info("TextAnalyzer initialized successfully.")
+        except Exception as e:
+            logging.warning(
+                f"Could not load SentenceTransformer model: {e}. Semantic features will be disabled."
+            )
+            self.sentence_model = None
 
     def analyze(self, text: str) -> Dict[str, Any]:
         """Runs a full suite of text analyses."""
@@ -855,6 +868,7 @@ class DocumentProcessor:
         self.chunking_engine = ChunkingEngine(self.text_analyzer, self.config)
         self.executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
         self.document_cache: Dict[str, ProcessedDocument] = {}
+        self.is_initialized = False
 
         self.extractor_map = {
             DocumentType.PDF: PdfExtractor(self.config),
@@ -867,6 +881,36 @@ class DocumentProcessor:
             DocumentType.RAR: ArchiveExtractor(self.config),
             DocumentType.SEVEN_Z: ArchiveExtractor(self.config),
         }
+
+    async def initialize(self):
+        """
+        Initializes the document processor and its sub-components, particularly
+        those that involve loading heavy resources like ML models.
+        """
+        if self.is_initialized:
+            logger.info("DocumentProcessor is already initialized.")
+            return
+
+        logger.info("Initializing DocumentProcessor...")
+        # The most important sub-component to initialize is the TextAnalyzer,
+        # as it loads a sentence-transformer model.
+        await self.text_analyzer.initialize()
+
+        # We can also perform a quick health check of dependencies here.
+        try:
+            pytesseract.get_tesseract_version()
+        except pytesseract.TesseractNotFoundError:
+            logger.error(
+                "Tesseract is not installed or not in your PATH. OCR will fail."
+            )
+
+        if nlp is None:
+            logger.warning(
+                "spaCy model 'en_core_web_sm' not loaded. NER features will be disabled."
+            )
+
+        self.is_initialized = True
+        logger.info("DocumentProcessor initialized successfully.")
 
     def _get_extractor(self, doc_type: DocumentType) -> Optional[BaseExtractor]:
         return self.extractor_map.get(doc_type)
@@ -943,6 +987,14 @@ class DocumentProcessor:
         redacted_text: Optional[str] = None
         chunks: List[DocumentChunk] = []
         cache_key: Optional[str] = None
+
+        if not self.is_initialized:
+            logger.error(
+                "DocumentProcessor has not been initialized. Call `await processor.initialize()` before use."
+            )
+            raise RuntimeError(
+                "DocumentProcessor has not been initialized. Call `await processor.initialize()` before use."
+            )
 
         try:
             metadata = await self._create_metadata(file_path)

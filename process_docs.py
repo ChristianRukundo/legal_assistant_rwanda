@@ -24,8 +24,8 @@ from tqdm.asyncio import tqdm_asyncio
 import os
 
 from document_processor import DocumentProcessor
-from rag_pipeline import AdvancedEmbeddingManager
-from data_models import initialize_database
+from embedding_manager import AdvancedEmbeddingManager
+from data_models import initialize_database, DB_PATH
 from document_ingestion_service import DocumentIngestionService
 from vector_store_manager import VectorStoreManager
 
@@ -43,7 +43,7 @@ async def clear_existing_knowledge_base():
     This is a destructive operation and should be used with caution.
     """
     logger.warning("--- CLEARING EXISTING KNOWLEDGE BASE ---")
-    db_file = Path("vector_db/knowledge_base.db")
+    db_file = Path(DB_PATH)
     index_file = Path("vector_db/faiss_index.index")
 
     try:
@@ -79,6 +79,7 @@ async def main(args: argparse.Namespace):
 
     # 2. Initialize core components required for ingestion
     doc_processor = DocumentProcessor()
+    await doc_processor.initialize()
 
     embedding_manager = AdvancedEmbeddingManager()
     await embedding_manager.initialize()  # Load the sentence-transformer model
@@ -111,7 +112,7 @@ async def main(args: argparse.Namespace):
 
     # 4. Create and run ingestion tasks concurrently for efficiency
     tasks = [
-        ingestion_service.process_and_index_document(doc_path) for doc_path in doc_files
+        ingestion_service.process_and_index_document(str(doc_path)) for doc_path in doc_files
     ]
 
     # Use tqdm_asyncio for a real-time progress bar in the console

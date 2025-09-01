@@ -66,6 +66,7 @@ async def initialize_components() -> None:
         app_state["cache_manager"] = cache_manager
 
         document_processor = DocumentProcessor()
+        await document_processor.initialize()
         app_state["document_processor"] = document_processor
 
         model_orchestrator = ProductionModelOrchestrator()
