@@ -40,7 +40,6 @@ Thumbs.db
 ehthumbs.db
 
 # IDEs and Editors
-.vscode/           # VS Code specific settings/files
 .idea/             # IntelliJ IDEA / PyCharm
 *.sublime-project
 *.sublime-workspace
@@ -65,3 +64,7 @@ models/
 
 # Miscellaneous
 .history/ # VSCode Local History
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore
