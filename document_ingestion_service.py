@@ -1,23 +1,28 @@
 """
-DocumentIngestionService: Handles the end-to-end process of ingesting a single document
-into the knowledge base, including processing, database updates, and vector indexing.
+Service for ingesting documents into the system, including processing,
+database updates, and vector indexing.
 """
 
 import asyncio
 import hashlib
-import logging
 from pathlib import Path
 from typing import List
+from datetime import datetime
 
-from document_processor import DocumentProcessor, ProcessedDocument, ProcessingStatus
+import aiosqlite
+import structlog
+
 from data_models import get_db_connection
+from document_processor import DocumentProcessor, ProcessingStatus
+from embedding_manager import AdvancedEmbeddingManager
 from vector_store_manager import VectorStoreManager
-from rag_pipeline import AdvancedEmbeddingManager
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class DocumentIngestionService:
+    """Handles the end-to-end process of ingesting and indexing documents."""
+
     def __init__(
         self,
         doc_processor: DocumentProcessor,
@@ -28,130 +33,101 @@ class DocumentIngestionService:
         self.embedding_manager = embedding_manager
         self.vector_store_manager = vector_store_manager
 
-    def _calculate_file_hash(self, file_path: Path) -> str:
-        """Calculates the SHA256 hash of a file."""
-        sha256 = hashlib.sha256()
-        with open(file_path, "rb") as f:
-            while chunk := f.read(8192):
-                sha256.update(chunk)
-        return sha256.hexdigest()
-
-    async def process_and_index_document(self, file_path: Path):
-        """Processes a single document and updates the knowledge base."""
+    async def process_and_index_document(self, file_path: str):
+        """Processes a single document, updates the database, and indexes it."""
         logger.info(f"Starting ingestion for: {file_path}")
-        if not file_path.exists():
-            logger.warning(
-                f"File not found: {file_path}, attempting to delete from knowledge base."
-            )
-            await self.delete_document(str(file_path))
-            return
+        file_path_obj = Path(file_path)
 
         try:
-            file_hash = self._calculate_file_hash(file_path)
-            async with await get_db_connection() as db:
+            file_hash = self._get_file_hash(file_path_obj)
 
-                existing_doc = await db.execute(
+            # The line below was `async with await get_db_connection() as db:`,
+            # which caused a `RuntimeError: threads can only be started once`.
+            # The `await` is incorrect because `aiosqlite.connect()` (which is
+            # what get_db_connection wraps) returns a coroutine that also acts
+            # as an async context manager. The `async with` statement handles
+            # awaiting it correctly.
+            async with get_db_connection() as db:
+                db.row_factory = aiosqlite.Row
+
+                cursor = await db.execute(
                     "SELECT id, file_hash FROM documents WHERE file_path = ?",
-                    (str(file_path),),
+                    (str(file_path_obj),),
                 )
-                doc_row = await existing_doc.fetchone()
+                doc_record = await cursor.fetchone()
 
-                if doc_row and doc_row["file_hash"] == file_hash:
-                    logger.info(
-                        f"Document {file_path} is already up to date. Skipping."
+                if doc_record and doc_record["file_hash"] == file_hash:
+                    logger.info(f"Document {file_path} is already up to date.")
+                    return
+
+                processed_docs = await self.doc_processor.batch_process([file_path])
+                processed_doc = processed_docs[0]
+
+                if processed_doc.metadata.status != ProcessingStatus.COMPLETED:
+                    logger.error(
+                        f"Failed to process {file_path}: {processed_doc.metadata.error_message}"
                     )
                     return
 
-                if doc_row:
-                    logger.info(
-                        f"Document {file_path} has been modified. Re-indexing..."
+                if doc_record:
+                    doc_id = doc_record["id"]
+                    cursor = await db.execute(
+                        "SELECT id FROM chunks WHERE doc_id = ?", (doc_id,)
                     )
-                    await self._delete_document_data(db, doc_row["id"])
-
-                processed_doc = await self.doc_processor.process_document(
-                    str(file_path)
-                )
-
-                async with db.executescript("BEGIN TRANSACTION;"):
-                    if processed_doc.metadata.status == ProcessingStatus.COMPLETED:
-
-                        cursor = await db.execute(
-                            "INSERT INTO documents (file_path, file_hash, status) VALUES (?, ?, ?)",
-                            (str(file_path), file_hash, "COMPLETED"),
-                        )
-                        doc_id = cursor.lastrowid
-
-                        chunk_data = [
-                            (
-                                doc_id,
-                                chunk.content,
-                                chunk.page_number,
-                                chunk.chunk_index,
-                            )
-                            for chunk in processed_doc.chunks
-                        ]
-                        if chunk_data:
-                            await db.executemany(
-                                "INSERT INTO chunks (doc_id, content, page_number, chunk_index) VALUES (?, ?, ?, ?)",
-                                chunk_data,
-                            )
-
-                            chunk_rows = await db.execute(
-                                "SELECT id FROM chunks WHERE doc_id = ?", (doc_id,)
-                            )
-                            chunk_ids = [
-                                row["id"] for row in await chunk_rows.fetchall()
-                            ]
-
-                            chunk_contents = [
-                                chunk.content for chunk in processed_doc.chunks
-                            ]
-                            embeddings = self.embedding_manager.get_embeddings(
-                                chunk_contents
-                            )
-                            await self.vector_store_manager.add(embeddings, chunk_ids)
-                    else:
-                        logger.warning(
-                            f"Processing failed for {file_path}. Status: {processed_doc.metadata.status.value}"
-                        )
+                    old_chunk_ids = [row["id"] for row in await cursor.fetchall()]
+                    if old_chunk_ids:
+                        await self.vector_store_manager.remove(old_chunk_ids)
                         await db.execute(
-                            "INSERT INTO documents (file_path, file_hash, status) VALUES (?, ?, ?)",
-                            (
-                                str(file_path),
-                                file_hash,
-                                processed_doc.metadata.status.value,
-                            ),
+                            "DELETE FROM chunks WHERE doc_id = ?", (doc_id,)
                         )
 
-            logger.info(f"Successfully ingested and indexed document: {file_path}")
+                    await db.execute(
+                        "UPDATE documents SET file_hash = ?, status = 'COMPLETED', updated_at = ? WHERE id = ?",
+                        (file_hash, datetime.utcnow(), doc_id),
+                    )
+                else:
+                    cursor = await db.execute(
+                        "INSERT INTO documents (file_path, file_hash, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                        (
+                            str(file_path_obj),
+                            file_hash,
+                            "COMPLETED",
+                            datetime.utcnow(),
+                            datetime.utcnow(),
+                        ),
+                    )
+                    doc_id = cursor.lastrowid
+
+                if processed_doc.chunks:
+                    chunk_data = [
+                        (doc_id, chunk.content, chunk.page_number)
+                        for chunk in processed_doc.chunks
+                    ]
+                    await db.executemany(
+                        "INSERT INTO chunks (doc_id, content, page_number) VALUES (?, ?, ?)",
+                        chunk_data,
+                    )
+                    await db.commit()
+
+                    cursor = await db.execute(
+                        "SELECT id, content FROM chunks WHERE doc_id = ?", (doc_id,)
+                    )
+                    new_chunks = await cursor.fetchall()
+                    chunk_ids = [c["id"] for c in new_chunks]
+                    chunk_contents = [c["content"] for c in new_chunks]
+                    embeddings = self.embedding_manager.get_embeddings(chunk_contents)
+                    await self.vector_store_manager.add(embeddings, chunk_ids)
+
+                logger.info(f"Successfully ingested and indexed {file_path}")
 
         except Exception as e:
             logger.error(f"Error during ingestion of {file_path}: {e}", exc_info=True)
+            raise
 
-    async def delete_document(self, file_path: str):
-        """Deletes a document and all its associated data from the knowledge base."""
-        logger.info(f"Deleting document from knowledge base: {file_path}")
-        async with await get_db_connection() as db:
-            async with db.executescript("BEGIN TRANSACTION;"):
-                cursor = await db.execute(
-                    "SELECT id FROM documents WHERE file_path = ?", (file_path,)
-                )
-                doc_row = await cursor.fetchone()
-                if doc_row:
-                    await self._delete_document_data(db, doc_row["id"])
-                    logger.info(f"Successfully deleted document: {file_path}")
-                else:
-                    logger.warning(
-                        f"Document not found in knowledge base for deletion: {file_path}"
-                    )
-
-    async def _delete_document_data(self, db, doc_id: int):
-        """Internal helper to delete a document's chunks, vectors, and metadata."""
-
-        cursor = await db.execute("SELECT id FROM chunks WHERE doc_id = ?", (doc_id,))
-        chunk_ids_to_remove = [row["id"] for row in await cursor.fetchall()]
-
-        if chunk_ids_to_remove:
-            await self.vector_store_manager.remove(chunk_ids_to_remove)
-
-        await db.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+    def _get_file_hash(self, file_path: Path) -> str:
+        """Computes the SHA256 hash of a file."""
+        h = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            while chunk := f.read(8192):
+                h.update(chunk)
+        return h.hexdigest()
