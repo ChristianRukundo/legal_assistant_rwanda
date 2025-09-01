@@ -61,7 +61,7 @@ ipython_config.py
 *.swp
 *.swo
 *.tmp
-/models
+models/
 
 # Miscellaneous
 .history/ # VSCode Local History
