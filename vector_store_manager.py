@@ -1,6 +1,7 @@
 """
 VectorStoreManager for handling the FAISS index with support for additions and removals.
 """
+
 import asyncio
 import logging
 from pathlib import Path
@@ -8,18 +9,19 @@ from typing import List, Tuple
 import numpy as np
 import faiss
 
-from rag_pipeline import EmbeddingManager
+from embedding_manager import AdvancedEmbeddingManager
 
 logger = logging.getLogger(__name__)
+
 
 class VectorStoreManager:
     """Manages the FAISS vector index for efficient updates."""
 
-    def __init__(self, index_path: Path, embedding_manager: EmbeddingManager):
+    def __init__(self, index_path: Path, embedding_manager: AdvancedEmbeddingManager):
         self.index_path = Path(index_path)
         self.embedding_manager = embedding_manager
         self.index: faiss.IndexIDMap | None = None
-        self.dimension = 384 # Default for all-MiniLM-L6-v2
+        self.dimension = 384  # Default for all-MiniLM-L6-v2
         self._lock = asyncio.Lock()
         self._initialized = False
 
@@ -37,37 +39,45 @@ class VectorStoreManager:
                     logger.info(f"Loading existing FAISS index from {self.index_path}")
                     self.index = faiss.read_index(str(self.index_path))
                 else:
-                    logger.info(f"No FAISS index found. Creating a new one with dimension {self.dimension}.")
+                    logger.info(
+                        f"No FAISS index found. Creating a new one with dimension {self.dimension}."
+                    )
                     # Use IndexIDMap to map our database chunk IDs to vectors
                     cpu_index = faiss.IndexFlatL2(self.dimension)
                     self.index = faiss.IndexIDMap(cpu_index)
-                
+
                 self._initialized = True
                 if self.index is not None:
-                    logger.info(f"Vector store initialized. Index contains {self.index.ntotal} vectors.")
+                    logger.info(
+                        f"Vector store initialized. Index contains {self.index.ntotal} vectors."
+                    )
                 else:
                     logger.warning("Vector store initialized, but index is None.")
 
             except Exception as e:
-                logger.error(f"Failed to initialize VectorStoreManager: {e}", exc_info=True)
+                logger.error(
+                    f"Failed to initialize VectorStoreManager: {e}", exc_info=True
+                )
                 raise
 
     async def add(self, vectors: np.ndarray, ids: List[int]):
         """Adds vectors with their corresponding database IDs to the index."""
         if not self._initialized or self.index is None:
             raise RuntimeError("VectorStoreManager not initialized.")
-        
+
         async with self._lock:
             vector_ids = np.array(ids, dtype=np.int64)
-            self.index.add_with_ids(vectors.astype(np.float32), xids=vector_ids) #type: ignore
+            self.index.add_with_ids(vectors.astype(np.float32), xids=vector_ids)  # type: ignore
             await self._save_index()
-            logger.info(f"Added {len(vectors)} vectors. Index now has {self.index.ntotal} total vectors.")
+            logger.info(
+                f"Added {len(vectors)} vectors. Index now has {self.index.ntotal} total vectors."
+            )
 
     async def remove(self, ids: List[int]):
         """Removes vectors by their database IDs from the index."""
         if not self._initialized or self.index is None:
             raise RuntimeError("VectorStoreManager not initialized.")
-        
+
         async with self._lock:
             if not ids:
                 return
@@ -75,14 +85,18 @@ class VectorStoreManager:
             removed_count = self.index.remove_ids(ids_to_remove)
             if removed_count > 0:
                 await self._save_index()
-            logger.info(f"Removed {removed_count} vectors. Index now has {self.index.ntotal} total vectors.")
+            logger.info(
+                f"Removed {removed_count} vectors. Index now has {self.index.ntotal} total vectors."
+            )
 
-    async def search(self, query_vector: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    async def search(
+        self, query_vector: np.ndarray, k: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """Searches the index for the k nearest neighbors."""
         if not self._initialized or self.index is None or self.index.ntotal == 0:
             return np.array([]), np.array([])
-        
-        distances, ids = self.index.search(query_vector.astype(np.float32), k) #type: ignore
+
+        distances, ids = self.index.search(query_vector.astype(np.float32), k)  # type: ignore
         return distances, ids
 
     async def _save_index(self):

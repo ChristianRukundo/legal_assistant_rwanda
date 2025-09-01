@@ -1,7 +1,8 @@
 # Core Web Framework
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
-pydantic==2.5.0
+pydantic
+pydantic-settings
 structlog==23.2.0
 
 # Asynchronous Operations
@@ -12,7 +13,7 @@ aiohttp==3.9.1
 # Install PyTorch separately using the official command (see guide below)
 # torch==2.6.0
 # torchaudio==2.6.0
-transformers==4.36.2
+llama-cpp-python==0.2.20
 sentence-transformers==2.7.0
 langchain-core==0.1.41
 langchain-community==0.0.32

@@ -24,7 +24,7 @@ from tqdm.asyncio import tqdm_asyncio
 import os
 
 from document_processor import DocumentProcessor
-from rag_pipeline import EmbeddingManager
+from rag_pipeline import AdvancedEmbeddingManager
 from data_models import initialize_database
 from document_ingestion_service import DocumentIngestionService
 from vector_store_manager import VectorStoreManager
@@ -80,7 +80,7 @@ async def main(args: argparse.Namespace):
     # 2. Initialize core components required for ingestion
     doc_processor = DocumentProcessor()
 
-    embedding_manager = EmbeddingManager()
+    embedding_manager = AdvancedEmbeddingManager()
     await embedding_manager.initialize()  # Load the sentence-transformer model
 
     vector_store_manager = VectorStoreManager(

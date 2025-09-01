@@ -919,16 +919,7 @@ class QueryProcessor:
         self.model_orchestrator = model_orchestrator
 
         self.sentence_model: Optional[SentenceTransformer] = None
-        try:
-            self.sentence_model = SentenceTransformer("all-MiniLM-L6-v2")
-        except Exception:
-            pass
-
-        self.query_cache = {}
-        self.cache_size_limit = self.config.get("cache_size_limit", 1000)
-
         self.thread_pool = ThreadPoolExecutor(max_workers=4)
-
         self.conversation_contexts = {}
         self.context_timeout = timedelta(hours=2)
 
@@ -937,8 +928,13 @@ class QueryProcessor:
         logger.info("Initializing IntelligentQueryProcessor...")
         try:
             # Load SentenceTransformer model
+            loop = asyncio.get_running_loop()
             if self.sentence_model is None:
-                self.sentence_model = SentenceTransformer("all-MiniLM-L6-v2")
+                self.sentence_model = await loop.run_in_executor(
+                    self.thread_pool,
+                    SentenceTransformer,
+                    "all-MiniLM-L6-v2"
+                )
                 logger.info("Loaded SentenceTransformer model.")
 
             # Ensure NLTK data is available
@@ -1380,113 +1376,170 @@ Standalone Question: [/INST]"""
 
         return suggestions[:5]
 
-    def _create_embedding(self, text: str) -> Optional[np.ndarray]:
+    async def _create_embedding(self, text: str) -> Optional[np.ndarray]:
         """Create semantic embedding for the query"""
         if self.sentence_model is None:
             return None
 
         try:
+            loop = asyncio.get_running_loop()
+            embedding = await loop.run_in_executor(
+                self.thread_pool,
+                self.sentence_model.encode,
+                text,
+                {"convert_to_numpy": True}
+            )
 
-            embedding = self.sentence_model.encode(text, convert_to_numpy=True)
             if isinstance(embedding, torch.Tensor):
                 embedding = embedding.detach().cpu().numpy()
             elif isinstance(embedding, list):
                 embedding = np.array(embedding)
             return embedding
-        except Exception:
+        except Exception as e:
+            logger.error("Failed to create embedding", error=str(e), exc_info=True)
             return None
+
+    def _perform_sync_analysis(
+        self, cleaned_query: str, resolved_query: str, detected_language: QueryLanguage
+    ) -> Dict[str, Any]:
+        """
+        Synchronous helper to run all CPU-bound analysis tasks off the event loop.
+        """
+        # Use Kinyarwanda processor if needed for translation before analysis
+        analysis_query = (
+            self.kinyarwanda_processor.translate_legal_terms(cleaned_query)
+            if detected_language == QueryLanguage.KINYARWANDA
+            else cleaned_query
+        )
+
+        entities = self._extract_entities(analysis_query, detected_language)
+        keywords = self._extract_keywords(analysis_query, detected_language)
+        legal_concepts = self.legal_concept_extractor.extract_legal_concepts(
+            analysis_query
+        )
+
+        # Hybrid intent classification
+        intent_rule, conf_rule = self.intent_classifier.classify_intent_rule_based(analysis_query)
+        intent_ml, conf_ml = self.intent_classifier.classify_intent_ml(analysis_query)
+        intent, intent_confidence = (intent_ml, conf_ml) if conf_ml > conf_rule else (intent_rule, conf_rule)
+
+        emotional_tone, _ = self.emotion_analyzer.analyze_emotion(resolved_query)
+        complexity, complexity_details = self.complexity_analyzer.analyze_complexity(
+            cleaned_query, legal_concepts, entities
+        )
+        question_type = self._determine_question_type(cleaned_query, detected_language)
+        urgency_level = self._assess_urgency(
+            cleaned_query, detected_language, emotional_tone
+        )
+        requires_disclaimer = self._requires_disclaimer(intent, complexity)
+        expanded_queries = self._expand_query(keywords, entities)
+
+        return {
+            "language": detected_language,
+            "intent": intent,
+            "intent_confidence": intent_confidence,
+            "complexity": complexity,
+            "emotional_tone": emotional_tone,
+            "keywords": keywords,
+            "entities": entities,
+            "legal_concepts": legal_concepts,
+            "question_type": question_type,
+            "urgency_level": urgency_level,
+            "requires_disclaimer": requires_disclaimer,
+            "expanded_queries": expanded_queries,
+            "metadata": {"complexity_details": complexity_details}
+        }
 
     async def comprehensive_analyze(
         self,
         query: str,
-        language: str, # This is a hint, but we still detect
+        language: str,  # This is a hint, but we still detect
         session_id: str,
-        conversation_history: Optional[List[Dict[str, str]]] = None
+        conversation_history: Optional[List[Dict[str, str]]] = None,
     ) -> ProcessedQuery:
         """
         The main public method for comprehensive query analysis with context.
+        This version is non-blocking and consolidates all analysis logic.
         """
         start_time = time.time()
-        
-        # 1. Resolve query based on context
-        resolved_query = await self._resolve_query_with_context(query, conversation_history or [])
 
-        # 2. Run the full analysis pipeline on the resolved query
+        # 1. Resolve query based on context
+        history = conversation_history or []
+        resolved_query = await self._resolve_query_with_context(query, history)
+
         try:
+            # 2. Perform basic, fast operations on the event loop
             cleaned_query = self._clean_query(resolved_query)
             detected_language = self._detect_language(cleaned_query)
-            
-            # Use Kinyarwanda processor if needed for translation before analysis
-            analysis_query = self.kinyarwanda_processor.translate_legal_terms(cleaned_query) if detected_language == QueryLanguage.KINYARWANDA else cleaned_query
 
-            entities = self._extract_entities(analysis_query, detected_language)
-            keywords = self._extract_keywords(analysis_query, detected_language)
-            legal_concepts = self.legal_concept_extractor.extract_legal_concepts(analysis_query)
-            
-            intent, intent_confidence = self.intent_classifier.classify_intent_rule_based(analysis_query)
-            emotional_tone, _ = self.emotion_analyzer.analyze_emotion(resolved_query)
-            complexity, _ = self.complexity_analyzer.analyze_complexity(cleaned_query, legal_concepts, entities)
-            question_type = self._determine_question_type(cleaned_query, detected_language)
-            urgency_level = self._assess_urgency(cleaned_query, detected_language, emotional_tone)
-            requires_disclaimer = self._requires_disclaimer(intent, complexity)
-            
-            expanded_queries = self._expand_query(keywords, entities)
-            embedding = self._create_embedding(cleaned_query)
-            
+            # 3. Run CPU-bound analysis and embedding creation concurrently
+            loop = asyncio.get_running_loop()
+            analysis_task = loop.run_in_executor(
+                self.thread_pool,
+                self._perform_sync_analysis,
+                cleaned_query,
+                resolved_query,
+                detected_language,
+            )
+            embedding_task = self._create_embedding(cleaned_query)
+
+            analysis_results, embedding = await asyncio.gather(
+                analysis_task, embedding_task
+            )
+
             processing_time = time.time() - start_time
-            
+
+            # 4. Assemble the final ProcessedQuery object
             return ProcessedQuery(
                 original_query=query,
                 cleaned_query=cleaned_query,
-                language=detected_language,
-                intent=intent,
-                intent_confidence=intent_confidence,
-                complexity=complexity,
-                emotional_tone=emotional_tone,
-                keywords=keywords,
-                entities=entities,
-                legal_concepts=legal_concepts,
-                question_type=question_type,
-                urgency_level=urgency_level,
-                requires_disclaimer=requires_disclaimer,
-                suggested_followup=[], # Placeholder
+                suggested_followup=[],  # Placeholder
                 processing_time=processing_time,
-                expanded_queries=expanded_queries,
                 embedding=embedding,
-                context=QueryContext(previous_queries=[t['user'] for t in conversation_history or []], session_id=session_id, user_id=None, conversation_history=conversation_history or [], domain_context=None, geographic_context=None)
+                context=QueryContext(
+                    previous_queries=[t["user"] for t in history],
+                    session_id=session_id,
+                    user_id=None,
+                    conversation_history=history,
+                    domain_context=None,
+                    geographic_context=None,
+                ),
+                **analysis_results,
             )
 
         except Exception as e:
             logger.error(f"Error during query analysis pipeline: {e}", exc_info=True)
             return ProcessedQuery(
-                original_query=query, cleaned_query=query, language=QueryLanguage.UNKNOWN,
-                intent=QueryIntent.UNKNOWN, intent_confidence=0.0, complexity=QueryComplexity.SIMPLE,
-                emotional_tone=EmotionalTone.NEUTRAL, keywords=[], entities=[], legal_concepts=[],
-                question_type="unknown", urgency_level=1, requires_disclaimer=True,
-                suggested_followup=[], processing_time=time.time() - start_time,
-                expanded_queries=[], embedding=None
+                original_query=query,
+                cleaned_query=query,
+                language=QueryLanguage.UNKNOWN,
+                intent=QueryIntent.UNKNOWN,
+                intent_confidence=0.0,
+                complexity=QueryComplexity.SIMPLE,
+                emotional_tone=EmotionalTone.NEUTRAL,
+                keywords=[],
+                entities=[],
+                legal_concepts=[],
+                question_type="unknown",
+                urgency_level=1,
+                requires_disclaimer=True,
+                suggested_followup=[],
+                processing_time=time.time() - start_time,
+                expanded_queries=[],
+                embedding=None,
             )
-
 
     async def process_query(
         self, query: str, context: Optional[QueryContext] = None, use_cache: bool = True
     ) -> ProcessedQuery:
-        """Main query processing method"""
-
+        """
+        DEPRECATED: This method is superseded by `comprehensive_analyze`.
+        It is kept for backward compatibility but should not be used for new development.
+        """
+        logger.warning("The 'process_query' method is deprecated. Use 'comprehensive_analyze' instead.")
         start_time = time.time()
 
         try:
-            cache_key: Optional[str] = None
-
-            if use_cache:
-                cache_key = hashlib.md5(query.encode()).hexdigest()
-                if cache_key in self.query_cache:
-                    cached_result = self.query_cache[cache_key]
-                    query_processing_counter.labels(
-                        intent="cached", language="cached", complexity="cached"
-                    ).inc()
-                    return cached_result
-
             cleaned_query = self._clean_query(query)
 
             language = self._detect_language(cleaned_query)
@@ -1576,14 +1629,6 @@ Standalone Question: [/INST]"""
                     ),
                 },
             )
-
-            if use_cache and cache_key is not None:
-                if len(self.query_cache) >= self.cache_size_limit:
-
-                    oldest_key = next(iter(self.query_cache))
-                    del self.query_cache[oldest_key]
-
-                self.query_cache[cache_key] = processed_query
 
             query_processing_counter.labels(
                 intent=intent.value,
@@ -1703,8 +1748,8 @@ Standalone Question: [/INST]"""
     def get_processing_stats(self) -> Dict[str, Any]:
         """Get processing statistics"""
         return {
-            "cache_size": len(self.query_cache),
-            "cache_limit": self.cache_size_limit,
+            "cache_size": 0, # Caching is now external
+            "cache_limit": 0,
             "active_conversations": len(self.conversation_contexts),
             "supported_languages": [lang.value for lang in QueryLanguage],
             "supported_intents": [intent.value for intent in QueryIntent],
@@ -1713,7 +1758,7 @@ Standalone Question: [/INST]"""
 
     def clear_cache(self):
         """Clear query cache"""
-        self.query_cache.clear()
+        logger.warning("QueryProcessor.clear_cache() is deprecated. Use CacheManager.")
 
     def cleanup_old_contexts(self):
         """Clean up old conversation contexts"""
@@ -1730,7 +1775,6 @@ Standalone Question: [/INST]"""
     async def cleanup(self):
         """Cleanup resources"""
         self.thread_pool.shutdown(wait=True)
-        self.clear_cache()
         self.conversation_contexts.clear()
 
     async def health_check(self) -> bool:

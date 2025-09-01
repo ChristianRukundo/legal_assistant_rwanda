@@ -43,6 +43,7 @@ from production_components import (
 from data_models import get_db_connection
 from vector_store_manager import VectorStoreManager
 from retrieval_analyzer import RetrievalAnalyzer
+from embedding_manager import AdvancedEmbeddingManager
 
 
 logging.basicConfig(
@@ -83,85 +84,7 @@ class RetrievalResult:
     legal_citations: List[Dict[str, Any]] = field(default_factory=lambda: [])
 
 
-class EmbeddingManager:
-    """Manages multiple embedding models for different use cases."""
 
-    def __init__(self):
-        self.models: Dict[str, Optional[Union[SentenceTransformer, CrossEncoder]]] = {}
-
-        self.device_string = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model_configs = {
-            "multilingual": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-            "cross_encoder": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-            "semantic": "sentence-transformers/all-MiniLM-L6-v2",
-        }
-        self._parent_rag_pipeline: Optional["RAGPipeline"] = None
-
-    async def initialize(self):
-        """Initializes all embedding models asynchronously."""
-        logger.info("Initializing advanced embedding models...")
-        tasks = [
-            self._load_model(name, path) for name, path in self.model_configs.items()
-        ]
-        await asyncio.gather(*tasks)
-        logger.info("All embedding models load attempts completed.")
-
-    async def _load_model(self, model_name: str, model_path: str):
-        """Loads a single model into memory, running blocking operations in an executor."""
-        try:
-            loop = asyncio.get_running_loop()
-
-            def load_sync():
-                if "cross_encoder" in model_name:
-                    return CrossEncoder(model_path, device=self.device_string)
-                else:
-                    return SentenceTransformer(model_path, device=self.device_string)
-
-            self.models[model_name] = await loop.run_in_executor(None, load_sync)
-            logger.info(
-                f"Loaded model '{model_name}' on device '{self.device_string}'."
-            )
-        except Exception as e:
-            logger.error(f"Failed to load model {model_name}: {e}", exc_info=True)
-            self.models[model_name] = None
-
-    def get_embeddings(
-        self, texts: List[str], model_name: str = "semantic"
-    ) -> np.ndarray:
-        """Generates embeddings using a specified model, with fallback for failures."""
-        model = self.models.get(model_name)
-        if not isinstance(model, SentenceTransformer) or model is None:
-            logger.error(
-                f"Embedding model '{model_name}' not available or is not a SentenceTransformer. Returning zero embeddings."
-            )
-
-            return np.zeros((len(texts), 384), dtype=np.float32)
-
-        embeddings = model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
-
-        if not isinstance(embeddings, np.ndarray):
-            embeddings = np.array(embeddings, dtype=np.float32)
-        return embeddings
-
-    def rerank_documents(
-        self, query: str, documents_content: List[str], top_k: int
-    ) -> List[Tuple[int, float]]:
-        """
-        Reranks documents using a CrossEncoder model for higher precision.
-        `documents_content` is a list of strings (document texts).
-        """
-        model = self.models.get("cross_encoder")
-        if not isinstance(model, CrossEncoder) or model is None:
-            logger.warning(
-                "Cross-encoder model not available for reranking. Returning unreranked documents (initial order with dummy scores)."
-            )
-            return [(i, 1.0) for i in range(min(top_k, len(documents_content)))]
-
-        pairs = [[query, doc_content] for doc_content in documents_content]
-        scores = model.predict(pairs)
-        ranked_indices = np.argsort(scores)[::-1]
-
-        return [(int(idx), float(scores[idx])) for idx in ranked_indices[:top_k]]
 
 
 class DocumentGraphBuilder:
@@ -171,7 +94,6 @@ class DocumentGraphBuilder:
         self.graph = nx.DiGraph()
         self.entity_extractor: Optional[spacy.language.Language] = None
         self.is_initialized = False
-        self._parent_rag_pipeline: Optional["RAGPipeline"] = None
 
     async def initialize(self):
         """Initializes NLP models for graph construction."""
@@ -318,20 +240,17 @@ class DocumentGraphBuilder:
         return entities1.intersection(entities2)
 
     def find_related_documents_from_graph(
-        self, query_entity_texts: List[str], top_k: int = 5
+        self, query_entity_texts: List[str], all_documents: List[Document], top_k: int = 5
     ) -> List[Document]:
         """
         Finds LangChain Document objects related to query entities using graph traversal.
-        This requires a reference to the main RAG pipeline's 'documents' store.
+        This requires the main list of documents to be passed in.
         """
-        if (
-            not self.graph
-            or not self.is_initialized
-            or self._parent_rag_pipeline is None
-            or not self._parent_rag_pipeline.documents
-        ):
+        if not self.graph or not self.is_initialized or not all_documents:
             logger.warning(
-                "Graph or RAG pipeline documents not available for graph-based retrieval in DocumentGraphBuilder."
+                "Graph not available, not initialized, or no documents provided for graph-based retrieval.",
+                graph_exists=bool(self.graph),
+                is_initialized=self.is_initialized,
             )
             return []
 
@@ -371,7 +290,7 @@ class DocumentGraphBuilder:
                                 )
 
         doc_id_to_langchain_doc: Dict[str, Document] = {}
-        for i, doc in enumerate(self._parent_rag_pipeline.documents):
+        for i, doc in enumerate(all_documents):
 
             source_file_clean = (
                 doc.metadata.get("source_file", "unknown")
@@ -401,13 +320,15 @@ class HybridRetriever:
 
     def __init__(
         self,
-        embedding_manager: EmbeddingManager,
+        embedding_manager: AdvancedEmbeddingManager,
         config: RetrievalConfig,
         vector_store_manager: VectorStoreManager,
+        document_graph_builder: DocumentGraphBuilder,
     ):
         self.embedding_manager = embedding_manager
         self.config = config
         self.vector_store_manager = vector_store_manager
+        self.document_graph_builder = document_graph_builder
         self.vector_store: Optional[faiss.IndexFlatIP] = None
         self.bm25_retriever: Optional[BM25Retriever] = None
         self.documents_store: List[Document] = []
@@ -434,7 +355,7 @@ class HybridRetriever:
             dimension = embeddings.shape[1]
             self.vector_store = faiss.IndexFlatIP(dimension)
             faiss.normalize_L2(embeddings)
-            self.vector_store.add(embeddings.astype(np.float32)) #type: ignore
+            self.vector_store.add(embeddings.astype(np.float32))  # type: ignore
             logger.info(
                 f"FAISS vector store built with {len(documents)} documents, dimension {dimension}."
             )
@@ -584,7 +505,7 @@ class HybridRetriever:
 
                     distances, indices = self.vector_store.search(
                         query_embedding_reshaped, self.config.max_initial_retrieval_docs
-                    ) #type: ignore
+                    )  # type: ignore
 
                     for i, idx in enumerate(indices[0]):
                         if 0 <= idx < len(self.documents_store):
@@ -637,19 +558,17 @@ class HybridRetriever:
 
         if (
             self.config.enable_document_graph_analysis
-            and self.embedding_manager._parent_rag_pipeline is not None
-            and self.embedding_manager._parent_rag_pipeline.document_graph_builder.is_initialized
+            and self.document_graph_builder.is_initialized
             and query_context.entities
         ):
 
             query_entity_texts = [
-                ent["text"]
-                for ent in query_context.entities
-                if isinstance(ent, dict) and "text" in ent
+                entity.text
+                for entity in query_context.entities
             ]
             if query_entity_texts:
-                graph_related_docs = self.embedding_manager._parent_rag_pipeline.document_graph_builder.find_related_documents_from_graph(
-                    query_entity_texts, self.config.max_reranked_docs // 2
+                graph_related_docs = self.document_graph_builder.find_related_documents_from_graph(
+                    query_entity_texts, self.documents_store, self.config.max_reranked_docs // 2
                 )
 
                 for g_doc in graph_related_docs:
@@ -731,19 +650,13 @@ class RAGPipeline:
         self.monitoring_engine = monitoring_engine
 
         self.config = RetrievalConfig()
-        self.embedding_manager = EmbeddingManager()
-
-        self.embedding_manager._parent_rag_pipeline = self
-
+        self.embedding_manager = AdvancedEmbeddingManager()
         self.document_graph_builder = DocumentGraphBuilder()
-
         self.vector_store_manager = VectorStoreManager(
             index_path=Path("vector_db/faiss_index.index"),
             embedding_manager=self.embedding_manager,
         )
         self.retrieval_analyzer = RetrievalAnalyzer(model_orchestrator)
-
-        self.document_graph_builder._parent_rag_pipeline = self
 
         self.hybrid_retriever: Optional[HybridRetriever] = None
         self.documents: List[Document] = []
@@ -761,7 +674,10 @@ class RAGPipeline:
             await self._load_documents_from_db()
 
             self.hybrid_retriever = HybridRetriever(
-                self.embedding_manager, self.config, self.vector_store_manager
+                embedding_manager=self.embedding_manager,
+                config=self.config,
+                vector_store_manager=self.vector_store_manager,
+                document_graph_builder=self.document_graph_builder,
             )
             await self.hybrid_retriever.initialize(self.documents)
 
@@ -810,31 +726,6 @@ class RAGPipeline:
         except Exception as e:
             logger.error(f"Failed to load documents from database: {e}", exc_info=True)
             self.documents = []
-
-    def _extract_legal_citations(
-        self, documents: List[Document]
-    ) -> List[Dict[str, Any]]:
-        """
-        Formats a list of LangChain Documents into a structured list of citations.
-
-        Args:
-            documents: The final list of documents used to generate the answer.
-
-        Returns:
-            A list of dictionaries, each representing a citation.
-        """
-        citations = []
-        for doc in documents:
-            citations.append(
-                {
-                    "source_file": doc.metadata.get("source_file", "Unknown Document"),
-                    "page_number": doc.metadata.get("page_number", "N/A"),
-                    "excerpt": (
-                        doc.page_content[:250] + "..." if doc.page_content else ""
-                    ),
-                }
-            )
-        return citations
 
     async def _load_documents(self):
         """Loads and processes legal documents from the specified directory using DocumentProcessor."""
@@ -937,7 +828,10 @@ class RAGPipeline:
         conversational context awareness.
         """
         if not self.is_initialized or self.hybrid_retriever is None:
-            logger.error("RAG Pipeline is not initialized. Cannot process query.", query_id=query_id)
+            logger.error(
+                "RAG Pipeline is not initialized. Cannot process query.",
+                query_id=query_id,
+            )
             raise RuntimeError("RAG Pipeline not initialized. Cannot process query.")
 
         start_time = datetime.now()
@@ -1059,9 +953,7 @@ class RAGPipeline:
                 "processing_time": processing_time,
                 "retrieval_metadata": {
                     "strategy": retrieval_result.retrieval_strategy,
-                    "legal_citations": self._extract_legal_citations(
-                        retrieval_result.documents
-                    ),
+                    "legal_citations": retrieval_result.legal_citations,
                 },
             }
 
@@ -1129,8 +1021,9 @@ class RAGPipeline:
             health_status = False
 
         try:
-
-            health_status = False
+            if not  self.document_processor.health_check():
+                logger.error("Document processor failed health check.")
+                health_status = False
         except Exception as e:
             logger.error(f"Error checking DocumentProcessor health: {e}", exc_info=True)
             health_status = False

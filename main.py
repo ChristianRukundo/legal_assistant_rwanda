@@ -15,7 +15,6 @@ from fastapi import (
     HTTPException,
     UploadFile,
     File,
-    Request,
     BackgroundTasks,
     Query,
 )
@@ -43,11 +42,13 @@ from vector_store_manager import VectorStoreManager
 from document_ingestion_service import DocumentIngestionService
 from directory_watcher_service import DirectoryWatcherService
 from conversation_context_service import ConversationContextService
-
+from query_planner import QueryPlanner
+from multi_step_agent import MultiStepQueryAgent
+import structlog
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # Centralized application state
 app_state: Dict[str, Any] = {}
@@ -89,6 +90,17 @@ async def initialize_components() -> None:
         await rag_pipeline.initialize()
         app_state["rag_pipeline"] = rag_pipeline
 
+        query_planner = QueryPlanner(model_orchestrator=model_orchestrator)
+        app_state["query_planner"] = query_planner
+
+        multi_step_agent = MultiStepQueryAgent(
+            query_planner=query_planner,
+            query_analyzer=query_analyzer,
+            rag_pipeline=rag_pipeline,
+            model_orchestrator=model_orchestrator,
+        )
+        app_state["multi_step_agent"] = multi_step_agent
+
         ingestion_service = DocumentIngestionService(
             doc_processor=app_state["document_processor"],
             embedding_manager=app_state["rag_pipeline"].embedding_manager,
@@ -121,8 +133,9 @@ async def initialize_components() -> None:
 
 
 async def close_components() -> None:
-    """Gracefully close components during shutdown."""
     logger.info("Shutting down application components...")
+    if "watcher_service" in app_state:
+        app_state["watcher_service"].stop()
     if "cache_manager" in app_state and app_state["cache_manager"]:
         await app_state["cache_manager"].close()
     logger.info("Shutdown complete.")
@@ -242,51 +255,22 @@ async def root() -> Dict[str, str]:
 async def text_query(
     query_request: QueryRequest, background_tasks: BackgroundTasks
 ) -> QueryResponse:
-    """Processes a text-based legal query."""
-    components = {
-        "rag_pipeline": app_state.get("rag_pipeline"),
-        "query_analyzer": app_state.get("query_analyzer"),
-        "cache_manager": app_state.get("cache_manager"),
-    }
-    if not all(components.values()):
-        raise HTTPException(
-            status_code=503,
-            detail="Services are not fully initialized. Please try again shortly.",
-        )
-
-    # --- FIX 1: Use typing.cast to inform the linter the types are now guaranteed ---
-    rag_pipeline = cast(RAGPipeline, components["rag_pipeline"])
-    query_analyzer = cast(QueryProcessor, components["query_analyzer"])
-    cache_manager = cast(CacheManager, components["cache_manager"])
+    """Processes a text-based legal query using the multi-step agent."""
     context_service = cast(ConversationContextService, app_state["context_service"])
+    agent = cast(MultiStepQueryAgent, app_state["multi_step_agent"])
+
+    session_id = query_request.session_id or str(uuid.uuid4())
+    await context_service.get_or_create_session(session_id)
+    conversation_history = await context_service.get_history(session_id)
 
     start_time = time.time()
     query_id = str(uuid.uuid4())
-    session_id = query_request.session_id or str(uuid.uuid4())
-    await context_service.get_or_create_session(session_id)
-
-    conversation_history = await context_service.get_history(session_id)
 
     try:
-        logger.info(f"Processing text query: {query_id}")
-
-        cache_key = f"query:{hashlib.md5(f'{query_request.query}:{query_request.language}'.encode()).hexdigest()}"
-        cached_response = await cache_manager.cache.get(cache_key)
-        if cached_response and isinstance(cached_response, dict):
-            logger.info(f"Returning cached response for query: {query_id}")
-            return QueryResponse(**cached_response)
-
-        query_analysis = await query_analyzer.comprehensive_analyze(
+        agent_result = await agent.execute(
             query=query_request.query,
             language=query_request.language,
             session_id=session_id,
-            conversation_history=conversation_history,
-        )
-
-        rag_result = await rag_pipeline.enhanced_query(
-            query=query_request.query,
-            language=query_request.language,
-            query_analysis=query_analysis,
             query_id=query_id,
             conversation_history=conversation_history,
         )
@@ -297,33 +281,26 @@ async def text_query(
             context_service.add_turn,
             session_id=session_id,
             user_query=query_request.query,
-            assistant_response=rag_result["answer"],
+            assistant_response=agent_result["answer"],
         )
-
-        citations = [
-            {
-                "source_file": doc.metadata.get("source_file", "unknown"),
-                "page_number": doc.metadata.get("page_number", 1),
-                "excerpt": doc.page_content[:250] + "...",
-            }
-            for doc in rag_result.get("source_documents", [])
-        ]
 
         response = QueryResponse(
-            answer=rag_result["answer"],
-            citations=citations,
-            confidence_score=rag_result.get("confidence_score", 0.0),
+            answer=agent_result["answer"],
+            citations=agent_result["retrieval_metadata"]["legal_citations"],
+            confidence_score=agent_result.get("confidence_score", 0.0),
             processing_time=processing_time,
-            session_id=session_id,  # Return the session_id to the client
+            session_id=session_id,
         )
 
-        await cache_manager.cache.set(cache_key, response.model_dump(), ttl=3600)
-
-        logger.info(f"Query processed successfully: {query_id}")
         return response
 
     except Exception as e:
-        logger.error(f"Error processing query {query_id}: {e}", exc_info=True)
+        logger.error(
+            "Error processing text query via agent",
+            query_id=query_id,
+            error=str(e),
+            exc_info=True,
+        )
         raise HTTPException(
             status_code=500,
             detail="An internal error occurred while processing the query.",
@@ -334,47 +311,28 @@ async def text_query(
 async def voice_query(
     background_tasks: BackgroundTasks,
     audio_file: UploadFile = File(...),
-    session_id: Optional[str] = Query(
-        None, description="Session ID for maintaining conversation context."
-    ),
-    language: str = Query(
-        "rw",
-        pattern="^(rw|en|fr)$",
-        description="Expected language of the audio (rw, en, fr).",
-    ),
+    session_id: Optional[str] = Query(None),
+    language: str = Query("rw", pattern="^(rw|en|fr)$"),
 ) -> StreamingResponse:
-    """
-    Processes a voice-based legal query with full conversational context and streams back an audio response.
-    The client should send the session_id received from a previous response to continue a conversation.
-    """
-    # Cast components for type safety and clarity
+    """Processes a voice-based legal query using the multi-step agent and conversational context."""
     voice_processor = cast(VoiceProcessor, app_state["voice_processor"])
     context_service = cast(ConversationContextService, app_state["context_service"])
-    query_analyzer = cast(QueryProcessor, app_state["query_analyzer"])
-    rag_pipeline = cast(RAGPipeline, app_state["rag_pipeline"])
+    agent = cast(MultiStepQueryAgent, app_state["multi_step_agent"])
 
     query_id = str(uuid.uuid4())
-
-    # 1. MANAGE SESSION AND CONVERSATION HISTORY
-    # This logic now mirrors the text query endpoint perfectly.
     current_session_id = session_id or str(uuid.uuid4())
     await context_service.get_or_create_session(current_session_id)
     conversation_history = await context_service.get_history(current_session_id)
 
     try:
         logger.info(
-            f"Processing voice query for session: {current_session_id} (query_id={query_id})"
+            "Processing voice query via agent",
+            session_id=current_session_id,
+            query_id=query_id,
         )
-
-        if audio_file.size and audio_file.size > 15 * 1024 * 1024:  # 15MB limit
-            raise HTTPException(
-                status_code=413, detail="Audio file is too large. Limit is 15MB."
-            )
 
         audio_data = await audio_file.read()
 
-        # 2. TRANSCRIBE AUDIO
-        # The transcription itself is stateless but we pass session_id for logging.
         transcription_analysis = await voice_processor.enhanced_transcribe_audio(
             audio_data=audio_data,
             expected_language=language,
@@ -385,36 +343,23 @@ async def voice_query(
         if not transcribed_text or not transcribed_text.strip():
             raise HTTPException(
                 status_code=400,
-                detail="Could not transcribe audio. Please speak clearly and try again.",
+                detail="Could not transcribe audio. Please speak clearly.",
             )
 
         logger.info(
-            f"Audio transcribed: '{transcribed_text[:100]}...' (query_id={query_id})"
+            f"Audio transcribed: '{transcribed_text[:100]}...'", query_id=query_id
         )
 
-        # 3. ANALYZE TRANSCRIBED TEXT WITH CONTEXT
-        # Pass the fetched history to the analyzer for contextual query resolution.
-        query_analysis = await query_analyzer.comprehensive_analyze(
+        agent_result = await agent.execute(
             query=transcribed_text,
             language=transcription_analysis.detected_language,
             session_id=current_session_id,
-            conversation_history=conversation_history,
-        )
-
-        # 4. RUN THE FULL RAG PIPELINE
-        # Pass the history again for the final prompt generation.
-        rag_result = await rag_pipeline.enhanced_query(
-            query=transcribed_text,
-            language=transcription_analysis.detected_language,
-            query_analysis=query_analysis,
             query_id=query_id,
             conversation_history=conversation_history,
         )
 
-        final_answer_text = rag_result["answer"]
+        final_answer_text = agent_result["answer"]
 
-        # 5. SAVE THE CONVERSATION TURN
-        # Use a background task to avoid blocking the audio stream.
         background_tasks.add_task(
             context_service.add_turn,
             session_id=current_session_id,
@@ -422,9 +367,6 @@ async def voice_query(
             assistant_response=final_answer_text,
         )
 
-        # 6. SYNTHESIZE AND STREAM AUDIO RESPONSE
-        # Pass the user's emotion context from the transcription analysis to the TTS engine
-        # to generate an emotionally-aware response.
         emotion_context = transcription_analysis.emotion_analysis
 
         async def generate_audio_stream() -> AsyncGenerator[bytes, None]:
@@ -436,9 +378,9 @@ async def voice_query(
             yield audio_bytes
 
         logger.info(
-            f"Voice query processed successfully. Streaming audio response with (query_id={query_id})."
+            "Voice query processed successfully. Streaming audio response.",
+            query_id=query_id,
         )
-        # Add the session_id to the response headers so the client can easily capture it.
         return StreamingResponse(
             generate_audio_stream(),
             media_type="audio/mpeg",
@@ -446,8 +388,12 @@ async def voice_query(
         )
 
     except Exception as e:
-        logger.error(f"Error processing voice query {query_id}: {e}", exc_info=True)
-        # In a real app, you might want to stream back a pre-recorded error message.
+        logger.error(
+            "Error processing voice query via agent",
+            query_id=query_id,
+            error=str(e),
+            exc_info=True,
+        )
         raise HTTPException(
             status_code=500,
             detail="An internal error occurred while processing the voice query.",

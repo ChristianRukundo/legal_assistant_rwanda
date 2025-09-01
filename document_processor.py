@@ -75,6 +75,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s",
 )
+logger = logging.getLogger(__name__)
 
 # Set deterministic language detection for reproducibility
 DetectorFactory.seed = 0
@@ -1026,6 +1027,59 @@ class DocumentProcessor:
         """Processes a batch of documents concurrently."""
         tasks = [self.process_document(fp) for fp in file_paths]
         return await asyncio.gather(*tasks)
+
+    def health_check(self) -> bool:
+        """Checks the health of the DocumentProcessor and its dependencies."""
+        healthy = True
+        logger.info("Running DocumentProcessor health check...")
+        loop = asyncio.get_running_loop()
+
+        # 1. Check Tesseract OCR
+        try:
+            version = pytesseract.get_tesseract_version()
+            logger.info(f"Tesseract version {version} found.")
+        except pytesseract.TesseractNotFoundError:
+            logger.error("Tesseract is not installed or not in your PATH.")
+            healthy = False
+        except Exception as e:
+            logger.error(f"Error checking Tesseract: {e}", exc_info=True)
+            healthy = False
+
+        # 2. Check spaCy model
+        if nlp is None:
+            logger.error("spaCy 'en_core_web_sm' model is not loaded.")
+            healthy = False
+        else:
+            logger.info("spaCy 'en_core_web_sm' model is loaded.")
+
+        # 3. Check magic library
+        try:
+            # This is a fast, local operation, so running it directly is acceptable for a health check.
+            with tempfile.NamedTemporaryFile(mode='w', delete=True, suffix=".txt") as tmp:
+                tmp.write("test")
+                tmp.flush()
+                mime_type = magic.from_file(tmp.name, mime=True)
+                if mime_type == "text/plain":
+                    logger.info("Magic library is functioning correctly.")
+                else:
+                    logger.warning(f"Magic library returned unexpected mime type for .txt: {mime_type}")
+        except Exception as e:
+            logger.error(f"Magic library check failed: {e}", exc_info=True)
+            healthy = False
+
+        # 4. Check ThreadPoolExecutor
+        if self.executor._shutdown:
+            logger.error("ThreadPoolExecutor is shut down.")
+            healthy = False
+        else:
+            logger.info("ThreadPoolExecutor is active.")
+
+        if healthy:
+            logger.info("DocumentProcessor health check passed.")
+        else:
+            logger.error("DocumentProcessor health check failed.")
+            
+        return healthy
 
     async def cleanup(self):
         self.executor.shutdown()

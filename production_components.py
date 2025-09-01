@@ -1,123 +1,99 @@
 """
 Production Components for Inyandiko Legal AI Assistant
-Handles model orchestration and monitoring in production environment.
-Version: 1.4 (Offline Gated Model Loading & Quantization)
+Handles model orchestration (now with LlamaCpp for CPU) and monitoring.
+Version: 1.8 (CPU / GGUF Optimized)
 """
 
 import asyncio
 import logging
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from datetime import datetime
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from langchain_community.llms import LlamaCpp
 from langchain.schema import Document
 from prometheus_client import Counter, Histogram, Gauge, start_http_server
 import os
+import structlog
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class ProductionModelOrchestrator:
-    """Orchestrates LLM model loading and response generation."""
+    """Orchestrates LLM model loading and response generation using LlamaCpp."""
 
     def __init__(self):
-        self.model = None
-        self.tokenizer = None
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        # --- FIX 1: Reverting back to the pre-downloaded Mistral model ---
-        self.model_name = os.getenv("LLM_MODEL", "mistralai/Mistral-7B-Instruct-v0.2")
+        self.model: Optional[LlamaCpp] = None
+        
+        
+        self.model_path = os.getenv(
+            "LLM_MODEL_PATH", "models/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
+        )
 
         self.response_counter = Counter(
-            "model_responses_total", "Total model responses", ["status"]
+            "model_responses_total", "Total model responses", ["status", "type"]
         )
         self.response_duration = Histogram(
             "model_response_duration_seconds", "Response generation duration"
         )
 
     async def initialize(self):
-        """Loads the LLM model and tokenizer from the local cache."""
+        """Loads the GGUF model using LlamaCpp in a memory-efficient way."""
         logger.info(
-            f"Initializing ProductionModelOrchestrator with model: {self.model_name} on {self.device}"
+            "Initializing ProductionModelOrchestrator with GGUF model",
+            model_path=self.model_path,
         )
+
+        if not os.path.exists(self.model_path):
+            logger.error("FATAL: GGUF model file not found.", path=self.model_path)
+            logger.error(
+                "Please download the 'mistral-7b-instruct-v0.2.Q4_K_M.gguf' model from TheBloke on Hugging Face and place it in the 'models' directory."
+            )
+            raise FileNotFoundError(f"Model not found: {self.model_path}")
+
         try:
             loop = asyncio.get_running_loop()
 
-            def load_model_sync():
-                # Configuration for 4-bit quantization is essential for Mistral-7B on 8GB RAM
-                quantization_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_quant_type="nf4",
-                    bnb_4bit_compute_dtype=(
-                        torch.bfloat16
-                        if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-                        else torch.float32
-                    ),
-                    bnb_4bit_use_double_quant=False,
-                )
+            
+            llm_params = {
+                "model_path": self.model_path,
+                "n_ctx": 4096,  
+                "n_gpu_layers": 0,  
+                "n_batch": 512,  
+                "temperature": 0.7,  
+                "max_tokens": 1024,  
+                "top_p": 0.9,
+                "verbose": False,  
+            }
 
-                logger.info(
-                    "Attempting to load model and tokenizer from local cache ONLY."
-                )
+            
+            
+            def load_model_sync() -> LlamaCpp:
+                return LlamaCpp(**llm_params)
 
-                # --- FIX 2: Added local_files_only=True to prevent internet connection attempts ---
-                # This forces transformers to use the files you've already downloaded.
-                tokenizer = AutoTokenizer.from_pretrained(
-                    self.model_name, local_files_only=True
-                )
+            self.model = await loop.run_in_executor(None, load_model_sync)
+            logger.info("GGUF model loaded successfully via LlamaCpp.")
 
-                model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name,
-                    quantization_config=quantization_config,
-                    device_map="auto",
-                    local_files_only=True,
-                )
-                return tokenizer, model
-
-            self.tokenizer, self.model = await loop.run_in_executor(
-                None, load_model_sync
-            )
-            logger.info(
-                "Model and tokenizer loaded successfully from local cache in 4-bit mode."
-            )
-            logger.info(
-                f"Model memory footprint: {self.model.get_memory_footprint() / 1e9:.2f} GB"
-            )
-        except EnvironmentError as e:
-            logger.error(
-                f"FATAL: Could not load model from local cache. The necessary files might be missing or corrupted. {e}"
-            )
-            logger.error(
-                "Please ensure you have a stable internet connection and have successfully downloaded the model at least once."
-            )
-            raise
         except Exception as e:
             logger.error(
-                f"An unexpected error occurred while loading the model: {e}",
+                "An unexpected error occurred while loading the GGUF model",
+                error=str(e),
                 exc_info=True,
             )
             raise
 
-    async def generate_raw(self, prompt: str, max_new_tokens: int = 150) -> str:
-        """
-        Generates a raw text response from a prompt, for utility tasks.
-        """
-        if not self.model or not self.tokenizer:
+    async def _generate(self, prompt: str) -> str:
+        """Internal helper to run the blocking generation task in a thread pool."""
+        if not self.model:
+            logger.error("Model generation called before initialization.")
             raise RuntimeError("Model is not initialized.")
 
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        loop = asyncio.get_running_loop()
+        
+        
+        return await loop.run_in_executor(None, self.model.invoke, prompt)
 
-        generation_args = {
-            "max_new_tokens": max_new_tokens,
-            "temperature": 0.2,
-            "top_p": 0.9,
-            "do_sample": True,
-        }
-
-        outputs = self.model.generate(**inputs, **generation_args)
-        full_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-        answer = full_text.split("[/INST]")[-1].strip()
-        return answer
+    async def generate_raw(self, prompt: str, max_new_tokens: int = 150) -> str:
+        """Generates a raw text response. Note: max_new_tokens is set during LlamaCpp init."""
+        return await self._generate(prompt)
 
     async def generate_response(
         self,
@@ -126,7 +102,7 @@ class ProductionModelOrchestrator:
         language: str,
         conversation_summary: str,
     ) -> Dict[str, Any]:
-        """Generates a final, user-facing response using RAG and conversation history."""
+        """Generates a final, user-facing response using the loaded GGUF model."""
         start_time = datetime.now()
         try:
             context_str = (
@@ -135,10 +111,9 @@ class ProductionModelOrchestrator:
                 else "No context documents found."
             )
 
+            
             prompt = f"""<s>[INST] You are a helpful legal AI assistant specializing in Rwandan law. 
-Your task is to provide a clear and accurate response in {language}.
-You must base your answer *only* on the provided CONTEXT DOCUMENTS.
-Use the CONVERSATION SUMMARY for context about the user's ongoing needs, but do not answer questions from it.
+Your task is to provide a clear and accurate response in {language} based *only* on the provided context. Do not use any prior knowledge. If the context does not contain the answer, state that you cannot find the information in the provided documents.
 
 CONVERSATION SUMMARY:
 ---
@@ -150,28 +125,30 @@ CONTEXT DOCUMENTS:
 {context_str}
 ---
 
-Based on the CONVERSATION SUMMARY and ONLY the information in the CONTEXT DOCUMENTS, answer the following question.
-
 Question: {query} [/INST]"""
 
-            answer = await self.generate_raw(prompt, max_new_tokens=512)
+            answer = await self._generate(prompt)
 
             duration = (datetime.now() - start_time).total_seconds()
             self.response_counter.labels(status="success", type="rag").inc()
             self.response_duration.observe(duration)
 
-            return {"answer": answer}
+            return {"answer": answer.strip()}
 
         except Exception as e:
             self.response_counter.labels(status="error", type="rag").inc()
-            logger.error(f"Failed to generate RAG response: {e}", exc_info=True)
+            logger.error(
+                "Failed to generate RAG response with LlamaCpp",
+                error=str(e),
+                exc_info=True,
+            )
             return {
                 "answer": "I am sorry, but I encountered an error while generating a response."
             }
 
     async def health_check(self) -> bool:
         """Checks if the model is loaded and ready."""
-        return self.model is not None and self.tokenizer is not None
+        return self.model is not None
 
 
 class ProductionMonitoringEngine:
