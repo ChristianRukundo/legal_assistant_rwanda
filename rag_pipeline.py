@@ -695,7 +695,7 @@ class RAGPipeline:
         logger.info("Loading documents from knowledge base database...")
         all_docs = []
         try:
-            async with await get_db_connection() as db:
+            async with get_db_connection() as db:
                 query = """
                     SELECT c.id, c.content, c.page_number, d.file_path 
                     FROM chunks c JOIN documents d ON c.doc_id = d.id 

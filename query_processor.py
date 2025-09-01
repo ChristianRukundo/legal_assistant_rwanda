@@ -1386,8 +1386,7 @@ Standalone Question: [/INST]"""
             embedding = await loop.run_in_executor(
                 self.thread_pool,
                 self.sentence_model.encode,
-                text,
-                {"convert_to_numpy": True}
+                text
             )
 
             if isinstance(embedding, torch.Tensor):
@@ -1594,7 +1593,7 @@ Standalone Question: [/INST]"""
                 intent, legal_concepts
             )
 
-            embedding = self._create_embedding(cleaned_query)
+            embedding = await self._create_embedding(cleaned_query)
 
             expanded_queries = self._expand_query(keywords, entities)
 
@@ -1618,7 +1617,7 @@ Standalone Question: [/INST]"""
                 processing_time=processing_time,
                 expanded_queries=expanded_queries,
                 context=context,
-                embedding=embedding,
+                embedding=await embedding if asyncio.iscoroutine(embedding) else embedding,
                 metadata={
                     "complexity_details": complexity_details,
                     "emotion_confidence": emotion_confidence,
